@@ -1,9 +1,8 @@
 # SacabambaspOS
 
-The most epic operating system in all of eternal existence. In progress —
-built from scratch, stage by stage.
+The most epic operating system in all of eternal existence. In development.
 
-**Stage 0 — the foundation (done):** a **from-scratch bootloader** that boots on modern hardware (UEFI:
+Stage 0 is a **from-scratch bootloader** that boots on modern hardware (UEFI:
 Mac, PC, laptop, virtual machine), detects the display, and paints the
 **Sacabambaspis** full-screen. It runs entirely **live / in memory** — it reads
 only the USB, writes to **no disk**, and installs nothing. Pull the stick and
