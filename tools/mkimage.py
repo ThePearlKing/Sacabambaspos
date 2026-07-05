@@ -85,11 +85,13 @@ def build(esp_path, out_path, mbr_boot=None, align_mib=1):
         if len(code) > 440:
             raise SystemExit("MBR boot code >440 bytes")
         mbr[0:len(code)] = code
-    # protective partition entry at 0x1BE, type 0xEE, spans whole disk
+    # protective partition entry at 0x1BE, type 0xEE, spans whole disk.
+    # With embedded BIOS boot code, mark it active: some BIOSes refuse to
+    # boot an MBR with no active partition.
     prot_lba = 1
     prot_sz = min(total_sectors - 1, 0xFFFFFFFF)
     struct.pack_into("<B3sB3sII", mbr, 0x1BE,
-        0x00, b"\x00\x02\x00", 0xEE, b"\xff\xff\xff",
+        0x80 if mbr_boot else 0x00, b"\x00\x02\x00", 0xEE, b"\xff\xff\xff",
         prot_lba, prot_sz)
     mbr[0x1FE] = 0x55; mbr[0x1FF] = 0xAA
 

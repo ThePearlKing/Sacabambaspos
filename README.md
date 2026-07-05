@@ -9,9 +9,21 @@ only the USB, writes to **no disk**, and installs nothing. Pull the stick and
 your machine is untouched.
 
 ```
-  USB power-on  ->  firmware runs  \EFI\BOOT\BOOTX64.EFI  ->  GOP framebuffer
-                ->  load SACABASP.RAW  ->  scale-to-fit + centre  ->  idle
+  USB power-on -> firmware runs \EFI\BOOT\BOOTX64.EFI
+               -> boot log ([ OK ] watchdog, firmware, display, asset, live mode)
+               -> splash: Sacabambaspis scaled-to-fit + centred,
+                  "SacabambaspOS" title (cyan OS), version badge bottom-right
+               -> idle
 ```
+
+## Secure Boot
+
+The image is unsigned, so machines shipped with **Secure Boot enabled will
+refuse to run it** ("Security Violation" or a silent fall-through to the next
+boot entry). Disable Secure Boot in firmware setup first (usually
+Security → Secure Boot → Disabled; Mac with T2: Startup Security Utility →
+No Security). Booting the stick still writes nothing — re-enable Secure Boot
+afterwards and the machine is exactly as before.
 
 ## What's built from scratch
 

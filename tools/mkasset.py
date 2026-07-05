@@ -28,12 +28,15 @@ from PIL import Image
 MAGIC = b"SBMP"
 VERSION = 1
 PIXFMT_BGRA = 0
+DIM_CAP = 8192          # the bootloader rejects anything larger
+BOOT_BG = (6, 12, 30)   # deep sea blue; must match the splash background
 
 
 def build(src, dst, max_w, max_h):
     im = Image.open(src).convert("RGBA")
     # Downscale to fit within max box, preserve aspect. Never upscale here;
     # the boot stages upscale-to-fit at runtime for the actual panel res.
+    max_w, max_h = min(max_w, DIM_CAP), min(max_h, DIM_CAP)
     w, h = im.size
     if w > max_w or h > max_h:
         scale = min(max_w / w, max_h / h)
@@ -41,10 +44,15 @@ def build(src, dst, max_w, max_h):
         im = im.resize((nw, nh), Image.LANCZOS)
         w, h = im.size
 
-    # RGBA -> BGRA
-    r, g, b, a = im.split()
-    bgra = Image.merge("RGBA", (b, g, r, a))
-    px = bgra.tobytes()  # rows top-to-bottom, B,G,R,A per pixel
+    # The blitter ignores alpha, so composite transparency over the boot
+    # background here; reserved byte is stored as 0.
+    im = Image.alpha_composite(Image.new("RGBA", im.size, BOOT_BG + (255,)), im)
+
+    # RGBA -> BGRX
+    r, g, b, _ = im.split()
+    zero = Image.new("L", im.size, 0)
+    bgra = Image.merge("RGBA", (b, g, r, zero))
+    px = bgra.tobytes()  # rows top-to-bottom, B,G,R,X per pixel
 
     hdr = struct.pack("<4sIIIIIII", MAGIC, VERSION, w, h, 32, PIXFMT_BGRA, 0, 0)
     with open(dst, "wb") as f:

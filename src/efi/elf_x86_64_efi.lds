@@ -37,6 +37,7 @@ SECTIONS
     *(COMMON)
     . = ALIGN(16);
   }
+  . = ALIGN(4096);   /* PE SectionAlignment: every section RVA must be 4K */
   .dynamic  : { *(.dynamic) }
   . = ALIGN(4096);
   .rela : { *(.rela.dyn) *(.rela.plt) *(.rela.got) *(.rela.data*) }

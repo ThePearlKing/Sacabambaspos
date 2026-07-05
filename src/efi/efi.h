@@ -114,6 +114,12 @@ typedef struct {
   VOID *ImageBase; UINT64 ImageSize;
   UINT32 ImageCodeType, ImageDataType; VOID *Unload;
 } EFI_LOADED_IMAGE_PROTOCOL;
+#if defined(__i386__)
+/* Firmware lays out UINT64 fields 8-byte aligned even on ia32 (EDK2/MSVC);
+ * plain gcc -m32 aligns them to 4. The build must use -malign-double. */
+_Static_assert(__builtin_offsetof(EFI_LOADED_IMAGE_PROTOCOL, ImageSize) == 40,
+  "ia32 UEFI ABI mismatch: build with -malign-double");
+#endif
 
 /* ---- Simple File System / File ---- */
 struct _EFI_FILE_PROTOCOL;

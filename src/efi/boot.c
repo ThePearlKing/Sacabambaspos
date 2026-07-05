@@ -11,10 +11,7 @@
  * machine is untouched.
  */
 #include "efi.h"
-
-#define SBOS_NAME      "SacabambaspOS"
-#define SBOS_VERSION   "v0.1.0"
-#define SBOS_VERSION_W u"v0.1.0"     /* same string, CHAR16 for console logs */
+#include "version.h"
 
 static EFI_SYSTEM_TABLE *ST;
 static EFI_BOOT_SERVICES *BS;
@@ -22,6 +19,23 @@ static EFI_BOOT_SERVICES *BS;
 /* freestanding helpers (gcc may emit calls to these) */
 void *memset(void *d, int c, unsigned long n){unsigned char*p=d;while(n--)*p++=(unsigned char)c;return d;}
 void *memcpy(void *d, const void *s, unsigned long n){unsigned char*a=d;const unsigned char*b=s;while(n--)*a++=*b++;return d;}
+
+#if !defined(__x86_64__)
+/* ia32 has no native 64-bit divide; gcc emits calls to these libgcc
+ * intrinsics, and we link no libgcc. -Bsymbolic binds the calls directly at
+ * link time: no PLT, no runtime relocations, empty-.reloc trick intact. */
+static UINT64 udivmod64(UINT64 n, UINT64 d, UINT64 *rem){
+  UINT64 q=0, r=0;
+  for(int i=63;i>=0;i--){
+    r=(r<<1)|((n>>i)&1);
+    if(r>=d){ r-=d; q|=1ULL<<i; }
+  }
+  if(rem)*rem=r;
+  return q;
+}
+UINT64 __udivdi3(UINT64 n, UINT64 d){ return udivmod64(n,d,NULL); }
+UINT64 __umoddi3(UINT64 n, UINT64 d){ UINT64 r; udivmod64(n,d,&r); return r; }
+#endif
 
 static void puts16(CHAR16 *s){ if(ST&&ST->ConOut) ST->ConOut->OutputString(ST->ConOut, s); }
 
@@ -72,10 +86,15 @@ static UINT32 mkpix(EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mi, UINT8 r, UINT8 g, 
     case PixelRedGreenBlueReserved8BitPerColor: return ((UINT32)b<<16)|((UINT32)g<<8)|r;
     case PixelBitMask: {
       EFI_PIXEL_BITMASK *m=&mi->PixelInformation; UINT32 v=0;
-      /* shift each channel into its mask's low bit */
+      /* find each mask's shift and width */
       UINT32 rm=m->RedMask, gm=m->GreenMask, bm=m->BlueMask;
       int rs=0,gs=0,bs=0; while(rm&&!(rm&1)){rm>>=1;rs++;} while(gm&&!(gm&1)){gm>>=1;gs++;} while(bm&&!(bm&1)){bm>>=1;bs++;}
-      v |= ((UINT32)r<<rs)&m->RedMask; v |= ((UINT32)g<<gs)&m->GreenMask; v |= ((UINT32)b<<bs)&m->BlueMask;
+      int rw=0,gw=0,bw=0; while(rm&1){rm>>=1;rw++;} while(gm&1){gm>>=1;gw++;} while(bm&1){bm>>=1;bw++;}
+      /* scale each 8-bit channel into the mask's width: keep the TOP bits for
+       * narrow masks (5:6:5 etc), shift up for wide ones */
+      v |= ((rw<8 ? (UINT32)r>>(8-rw) : (UINT32)r<<(rw-8))<<rs) & m->RedMask;
+      v |= ((gw<8 ? (UINT32)g>>(8-gw) : (UINT32)g<<(gw-8))<<gs) & m->GreenMask;
+      v |= ((bw<8 ? (UINT32)b>>(8-bw) : (UINT32)b<<(bw-8))<<bs) & m->BlueMask;
       return v;
     }
     default: return ((UINT32)r<<16)|((UINT32)g<<8)|b;
@@ -107,21 +126,30 @@ static EFI_STATUS load_asset(EFI_HANDLE image, UINT8 **out, UINTN *outsz){
   SbmpHeader h; UINTN n=sizeof(h);
   s=f->Read(f,&n,&h); if(s||n!=sizeof(h)){ f->Close(f); return s?s:EFI_LOAD_ERROR; }
   if(!(h.magic[0]=='S'&&h.magic[1]=='B'&&h.magic[2]=='M'&&h.magic[3]=='P')){ f->Close(f); return EFI_LOAD_ERROR; }
-  /* sanity: reject absurd dims before the multiply (also guards 32-bit UINTN) */
-  if(h.width==0||h.height==0||h.width>8192||h.height>8192||h.bpp!=32){ f->Close(f); return EFI_LOAD_ERROR; }
+  /* sanity: reject unknown format revisions and absurd dims before the
+   * multiply (also guards 32-bit UINTN) */
+  if(h.version!=1||h.pixfmt!=0||h.bpp!=32){ f->Close(f); return EFI_UNSUPPORTED; }
+  if(h.width==0||h.height==0||h.width>8192||h.height>8192){ f->Close(f); return EFI_LOAD_ERROR; }
 
   UINTN pixbytes = (UINTN)h.width*h.height*4;
-  UINTN total = sizeof(h)+pixbytes;
   UINT8 *buf=NULL;
-  s=BS->AllocatePool(EfiLoaderData, total, (VOID**)&buf); if(s){ f->Close(f); return s; }
+  s=BS->AllocatePool(EfiLoaderData, sizeof(h)+pixbytes, (VOID**)&buf); if(s){ f->Close(f); return s; }
   memcpy(buf,&h,sizeof(h));
-  /* rewind and read whole file for simplicity */
-  f->SetPosition(f,0);
-  n=total; s=f->Read(f,&n,buf);
+  /* Read the payload in <=1MiB chunks and tolerate short reads: some real
+   * firmware FAT drivers misbehave on multi-MB single reads (same workaround
+   * the Linux EFI stub uses). File position is already past the header. */
+  UINTN got=0;
+  while(got<pixbytes){
+    UINTN want=pixbytes-got;
+    if(want>1024*1024) want=1024*1024;
+    s=f->Read(f,&want,buf+sizeof(h)+got);
+    if(s||want==0) break;
+    got+=want;
+  }
   f->Close(f);
-  if(s) return s;
-  if(n!=total){ BS->FreePool(buf); return EFI_LOAD_ERROR; }  /* truncated file */
-  *out=buf; *outsz=n; return EFI_SUCCESS;
+  if(s){ BS->FreePool(buf); return s; }
+  if(got!=pixbytes){ BS->FreePool(buf); return EFI_LOAD_ERROR; }  /* truncated */
+  *out=buf; *outsz=sizeof(h)+got; return EFI_SUCCESS;
 }
 
 static void draw(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, UINT8 *asset){
@@ -142,7 +170,18 @@ static void draw(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, UINT8 *asset){
   if(dw==0)dw=1; if(dh==0)dh=1;
   UINT32 ox=(sw-(UINT32)dw)/2, oy=(sh-(UINT32)dh)/2;
 
-  if(mi->PixelFormat==PixelBltOnly){
+  /* PixelBitMask does not imply 32bpp: the pixel size is the highest set bit
+   * across all masks, rounded up to whole bytes. Direct stores below assume
+   * 32bpp, so anything else must go through the firmware Blt path. */
+  UINT32 bpp=32;
+  if(mi->PixelFormat==PixelBitMask){
+    UINT32 m = mi->PixelInformation.RedMask | mi->PixelInformation.GreenMask |
+               mi->PixelInformation.BlueMask | mi->PixelInformation.ReservedMask;
+    bpp=0; while(m){ bpp++; m>>=1; }
+    bpp=(bpp+7)&~7u;
+  }
+
+  if(mi->PixelFormat==PixelBltOnly || (mi->PixelFormat==PixelBitMask && bpp!=32)){
     /* No CPU-mappable framebuffer: render the scaled image into a BLT buffer
      * and let the firmware blit it. Asset pixels are already BGRA, the exact
      * EFI_GRAPHICS_OUTPUT_BLT_PIXEL layout. */
@@ -180,6 +219,12 @@ static void draw(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, UINT8 *asset){
   }
 }
 
+/* A GOP is usable only if it reports a real mode with a nonzero resolution. */
+static int gop_ok(EFI_GRAPHICS_OUTPUT_PROTOCOL *g){
+  return g && g->Mode && g->Mode->Info &&
+         g->Mode->Info->HorizontalResolution && g->Mode->Info->VerticalResolution;
+}
+
 /* ---- version badge ------------------------------------------------------ */
 
 /* 8x8 glyphs, bit 7 = leftmost pixel; just the chars a version string needs. */
@@ -212,6 +257,11 @@ static const UINT8 *glyph(char c){
   return NULL;
 }
 
+/* Padded text-box geometry, shared by the renderer and its callers:
+ * 8px glyphs plus 2*scale padding on every side. */
+static UINT32 text_box_w(UINTN len, UINT32 scale){ return ((UINT32)len*8+4)*scale; }
+static UINT32 text_box_h(UINT32 scale)           { return 12*scale; }
+
 /* Paint a string at (x0,y0) = top-left of its padded box. Read-modify-write
  * via GOP Blt so it composites over whatever is there and works on every
  * pixel format, including PixelBltOnly. Box: w=(8*len+4)*scale, h=12*scale.
@@ -224,7 +274,7 @@ static void draw_text(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, const char *s,
   UINTN len=0; while(s[len]) len++;
 
   UINT32 pad=2*scale;
-  UINT32 w=(UINT32)len*8*scale+2*pad, h=8*scale+2*pad;
+  UINT32 w=text_box_w(len,scale), h=text_box_h(scale);
   if(x0+w>sw||y0+h>sh) return;
 
   EFI_GRAPHICS_OUTPUT_BLT_PIXEL *buf=NULL;
@@ -268,7 +318,7 @@ static void draw_version(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop){
   if(scale<2) scale=2; if(scale>12) scale=12;
   while(scale>2 && ((UINT32)len*8+8)*scale > sw) scale--;   /* still must fit */
 
-  UINT32 w=((UINT32)len*8+4)*scale, h=12*scale, margin=4*scale;
+  UINT32 w=text_box_w(len,scale), h=text_box_h(scale), margin=4*scale;
   if(w+margin>sw||h+margin>sh) return;
   draw_text(gop, SBOS_VERSION, scale, sw-w-margin, sh-h-margin, (UINTN)-1);
 }
@@ -283,7 +333,7 @@ static void draw_title(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop){
   if(scale<2) scale=2; if(scale>16) scale=16;
   while(scale>2 && ((UINT32)len*8+8)*scale > sw) scale--;   /* still must fit */
 
-  UINT32 w=((UINT32)len*8+4)*scale, h=12*scale, margin=2*scale;
+  UINT32 w=text_box_w(len,scale), h=text_box_h(scale), margin=2*scale;
   if(w+margin>sw||h+margin>sh) return;
   /* centre the text block on the left-middle of the screen (x = sw/4) */
   UINT32 x0 = sw/4 > w/2+margin ? sw/4-w/2 : margin;
@@ -319,10 +369,29 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st){
     puts16(u"\r\n");
   }
 
+  /* On multi-GOP systems (dual GPU, BMC video) LocateProtocol may return a
+   * GOP not wired to the visible panel, or one with a 0x0 mode. Prefer the
+   * console handle's GOP, then scan all handles, and validate whatever we
+   * pick before touching its framebuffer. */
   EFI_GUID gop_guid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
-  EFI_GRAPHICS_OUTPUT_PROTOCOL *gop=NULL;
-  if(BS->LocateProtocol(&gop_guid, NULL, (VOID**)&gop) || !gop){
-    log_fail(u"Graphics Output Protocol not found - cannot draw");
+  EFI_GRAPHICS_OUTPUT_PROTOCOL *gop=NULL, *cand=NULL;
+  if(ST->ConsoleOutHandle &&
+     !BS->HandleProtocol(ST->ConsoleOutHandle, &gop_guid, (VOID**)&cand) && gop_ok(cand))
+    gop=cand;
+  if(!gop){
+    EFI_HANDLE hs[32]; UINTN bsz=sizeof(hs);
+    if(!BS->LocateHandle(2 /*ByProtocol*/, &gop_guid, NULL, &bsz, hs))
+      for(UINTN i=0;i<bsz/sizeof(EFI_HANDLE) && !gop;i++){
+        cand=NULL;
+        if(!BS->HandleProtocol(hs[i], &gop_guid, (VOID**)&cand) && gop_ok(cand)) gop=cand;
+      }
+  }
+  if(!gop){
+    cand=NULL;
+    if(!BS->LocateProtocol(&gop_guid, NULL, (VOID**)&cand) && gop_ok(cand)) gop=cand;
+  }
+  if(!gop){
+    log_fail(u"No usable Graphics Output Protocol - cannot draw");
     for(;;) __asm__ __volatile__("hlt");
   }
   {

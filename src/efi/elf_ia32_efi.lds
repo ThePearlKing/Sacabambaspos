@@ -22,6 +22,7 @@ SECTIONS
     *(.dynbss) *(.bss) *(COMMON)
     . = ALIGN(16);
   }
+  . = ALIGN(4096);   /* PE SectionAlignment: every section RVA must be 4K */
   .dynamic : { *(.dynamic) }
   . = ALIGN(4096);
   .rel : { *(.rel.dyn) *(.rel.plt) *(.rel.got) *(.rel.data*) }

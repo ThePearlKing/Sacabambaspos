@@ -7,6 +7,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 MODE="${1:-uefi}"
 GUI="${2:-headless}"
+case "$MODE" in uefi|bios) ;; *) echo "usage: $0 [uefi|bios] [gui]"; exit 2;; esac
 IMG="build/sacabambaspos.img"
 SHOT="build/shot-$MODE.ppm"
 [ -f "$IMG" ] || { echo "no $IMG - run scripts/build.sh first"; exit 1; }
@@ -43,9 +44,12 @@ if [ "$GUI" = gui ]; then
 fi
 
 # headless: emulate VGA, drive monitor over stdio, screendump after boot settles
-echo "booting headless; screenshot -> $SHOT"
+LOG="build/qemu-$MODE.log"
+echo "booting headless; screenshot -> $SHOT (qemu log -> $LOG)"
+rm -f "$SHOT"
 ( sleep 12; echo "screendump $SHOT"; sleep 2; echo quit ) \
-  | "$QEMU" "${ARGS[@]}" -display none -monitor stdio -serial null >/dev/null 2>&1 || true
+  | "$QEMU" "${ARGS[@]}" -display none -monitor stdio -serial "file:build/serial-$MODE.log" \
+    >"$LOG" 2>&1 || true   # qemu exits nonzero on monitor 'quit'; failures show below
 
 if [ -f "$SHOT" ]; then
   python3 - "$SHOT" "build/shot-$MODE.png" <<'PY'
@@ -55,5 +59,7 @@ Image.open(sys.argv[1]).save(sys.argv[2])
 print("saved", sys.argv[2])
 PY
 else
-  echo "no screenshot produced"; exit 1
+  echo "no screenshot produced; last qemu output:"
+  tail -n 20 "$LOG"
+  exit 1
 fi
