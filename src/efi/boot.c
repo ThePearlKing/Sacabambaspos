@@ -12,7 +12,9 @@
  */
 #include "efi.h"
 
-#define SBOS_VERSION "v0.1.0"
+#define SBOS_NAME      "SacabambaspOS"
+#define SBOS_VERSION   "v0.1.0"
+#define SBOS_VERSION_W u"v0.1.0"     /* same string, CHAR16 for console logs */
 
 static EFI_SYSTEM_TABLE *ST;
 static EFI_BOOT_SERVICES *BS;
@@ -22,6 +24,40 @@ void *memset(void *d, int c, unsigned long n){unsigned char*p=d;while(n--)*p++=(
 void *memcpy(void *d, const void *s, unsigned long n){unsigned char*a=d;const unsigned char*b=s;while(n--)*a++=*b++;return d;}
 
 static void puts16(CHAR16 *s){ if(ST&&ST->ConOut) ST->ConOut->OutputString(ST->ConOut, s); }
+
+/* ---- boot log ----------------------------------------------------------- */
+/* EFI text attributes: fg | bg<<4 */
+#define ATTR_DIM    0x08  /* dark grey  */
+#define ATTR_TEXT   0x07  /* light grey */
+#define ATTR_BRIGHT 0x0F  /* white      */
+#define ATTR_OK     0x0A  /* green      */
+#define ATTR_FAIL   0x0C  /* red        */
+#define ATTR_TITLE  0x0B  /* cyan       */
+#define ATTR_WARN   0x0E  /* yellow     */
+
+static void con_attr(UINTN a){ if(ST->ConOut&&ST->ConOut->SetAttribute) ST->ConOut->SetAttribute(ST->ConOut,a); }
+
+static void log_tag(CHAR16 *tag, UINTN color){
+  con_attr(ATTR_DIM);  puts16(u"  [");
+  con_attr(color);     puts16(tag);
+  con_attr(ATTR_DIM);  puts16(u"] ");
+  con_attr(ATTR_TEXT);
+}
+static void log_ok(CHAR16 *m)  { log_tag(u"  OK  ",ATTR_OK);   puts16(m); puts16(u"\r\n"); }
+static void log_fail(CHAR16 *m){ log_tag(u" FAIL ",ATTR_FAIL); puts16(m); puts16(u"\r\n"); }
+
+static void print_u(UINT64 v){
+  CHAR16 b[21]; UINTN i=20; b[20]=0;
+  if(!v) b[--i]=u'0';
+  while(v){ b[--i]=(CHAR16)(u'0'+v%10); v/=10; }
+  puts16(b+i);
+}
+static void print_hex(UINT64 v){
+  CHAR16 b[19]; UINTN i=18; b[18]=0;
+  if(!v) b[--i]=u'0';
+  while(v){ UINT64 d=v&0xF; b[--i]=(CHAR16)(d<10?u'0'+d:u'A'+d-10); v>>=4; }
+  puts16(u"0x"); puts16(b+i);
+}
 
 /* SBMP asset header, must match tools/mkasset.py */
 typedef struct {
@@ -161,6 +197,14 @@ static const Glyph font[] = {
   {'9',{0x3C,0x66,0x66,0x3E,0x06,0x66,0x3C,0x00}},
   {'.',{0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x00}},
   {'v',{0x00,0x00,0x66,0x66,0x66,0x3C,0x18,0x00}},
+  {'S',{0x3C,0x66,0x60,0x3C,0x06,0x66,0x3C,0x00}},
+  {'O',{0x3C,0x66,0x66,0x66,0x66,0x66,0x3C,0x00}},
+  {'a',{0x00,0x00,0x3C,0x06,0x3E,0x66,0x3E,0x00}},
+  {'b',{0x60,0x60,0x7C,0x66,0x66,0x66,0x7C,0x00}},
+  {'c',{0x00,0x00,0x3C,0x66,0x60,0x66,0x3C,0x00}},
+  {'m',{0x00,0x00,0x66,0x7F,0x6B,0x6B,0x63,0x00}},
+  {'p',{0x00,0x00,0x7C,0x66,0x66,0x7C,0x60,0x60}},
+  {'s',{0x00,0x00,0x3E,0x60,0x3C,0x06,0x7C,0x00}},
 };
 
 static const UINT8 *glyph(char c){
@@ -168,23 +212,18 @@ static const UINT8 *glyph(char c){
   return NULL;
 }
 
-/* Paint SBOS_VERSION big in the bottom-right corner. Read-modify-write via
- * GOP Blt so it composites over whatever is there and works on every pixel
- * format, including PixelBltOnly. */
-static void draw_version(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop){
+/* Paint a string at (x0,y0) = top-left of its padded box. Read-modify-write
+ * via GOP Blt so it composites over whatever is there and works on every
+ * pixel format, including PixelBltOnly. Box: w=(8*len+4)*scale, h=12*scale. */
+static void draw_text(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, const char *s,
+                      UINT32 scale, UINT32 x0, UINT32 y0){
   EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mi=gop->Mode->Info;
   UINT32 sw=mi->HorizontalResolution, sh=mi->VerticalResolution;
-  const char *v=SBOS_VERSION;
-  UINTN len=0; while(v[len]) len++;
+  UINTN len=0; while(s[len]) len++;
 
-  UINT32 scale = sh/120;                       /* ~64px glyphs at 1080p: large */
-  if(scale<2) scale=2; if(scale>12) scale=12;
-  while(scale>2 && ((UINT32)len*8+8)*scale > sw) scale--;   /* still must fit */
-
-  UINT32 pad=2*scale, margin=4*scale;
+  UINT32 pad=2*scale;
   UINT32 w=(UINT32)len*8*scale+2*pad, h=8*scale+2*pad;
-  if(w>sw||h>sh) return;
-  UINT32 x0=sw-w-margin, y0=sh-h-margin;
+  if(x0+w>sw||y0+h>sh) return;
 
   EFI_GRAPHICS_OUTPUT_BLT_PIXEL *buf=NULL;
   if(BS->AllocatePool(EfiLoaderData,(UINTN)w*h*4,(VOID**)&buf)||!buf) return;
@@ -197,7 +236,7 @@ static void draw_version(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop){
       ? (EFI_GRAPHICS_OUTPUT_BLT_PIXEL){255,255,255,0}
       : (EFI_GRAPHICS_OUTPUT_BLT_PIXEL){10,16,28,0};
     for(UINTN ci=0;ci<len;ci++){
-      const UINT8 *g=glyph(v[ci]); if(!g) continue;
+      const UINT8 *g=glyph(s[ci]); if(!g) continue;
       for(UINT32 gy=0;gy<8;gy++){
         UINT8 bits=g[gy]; if(!bits) continue;
         for(UINT32 gx=0;gx<8;gx++){
@@ -215,39 +254,112 @@ static void draw_version(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop){
   BS->FreePool(buf);
 }
 
+/* SBOS_VERSION, large, bottom-right corner. */
+static void draw_version(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop){
+  EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mi=gop->Mode->Info;
+  UINT32 sw=mi->HorizontalResolution, sh=mi->VerticalResolution;
+  UINTN len=sizeof(SBOS_VERSION)-1;
+
+  UINT32 scale = sh/120;                       /* ~64px glyphs at 1080p: large */
+  if(scale<2) scale=2; if(scale>12) scale=12;
+  while(scale>2 && ((UINT32)len*8+8)*scale > sw) scale--;   /* still must fit */
+
+  UINT32 w=((UINT32)len*8+4)*scale, h=12*scale, margin=4*scale;
+  if(w+margin>sw||h+margin>sh) return;
+  draw_text(gop, SBOS_VERSION, scale, sw-w-margin, sh-h-margin);
+}
+
+/* SBOS_NAME, larger still, across the top starting left of centre. */
+static void draw_title(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop){
+  EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mi=gop->Mode->Info;
+  UINT32 sw=mi->HorizontalResolution, sh=mi->VerticalResolution;
+  UINTN len=sizeof(SBOS_NAME)-1;
+
+  UINT32 scale = sh/80;                        /* bigger than the version tag */
+  if(scale<2) scale=2; if(scale>16) scale=16;
+  while(scale>2 && ((UINT32)len*8+8)*scale > sw) scale--;   /* still must fit */
+
+  UINT32 w=((UINT32)len*8+4)*scale, h=12*scale, margin=2*scale;
+  if(w+margin>sw||h+margin>sh) return;
+  /* centre the text block on the left-middle of the screen (x = sw/4) */
+  UINT32 x0 = sw/4 > w/2+margin ? sw/4-w/2 : margin;
+  draw_text(gop, SBOS_NAME, scale, x0, margin);
+}
+
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st){
   ST=st; BS=st->BootServices;
   /* Firmware arms a ~5-minute watchdog that resets the machine unless the app
    * exits or ExitBootServices is called. We idle forever, so disarm it. */
-  BS->SetWatchdogTimer(0, 0, 0, NULL);
-  if(ST->ConOut) ST->ConOut->Reset(ST->ConOut, 0);
-  puts16(u"SacabambaspOS boot...\r\n");
+  EFI_STATUS wd = BS->SetWatchdogTimer(0, 0, 0, NULL);
+
+  if(ST->ConOut){
+    ST->ConOut->Reset(ST->ConOut, 0);
+    if(ST->ConOut->ClearScreen) ST->ConOut->ClearScreen(ST->ConOut);
+  }
+
+  /* banner */
+  puts16(u"\r\n");
+  con_attr(ATTR_TITLE);  puts16(u"  SacabambaspOS ");
+  con_attr(ATTR_BRIGHT); puts16(SBOS_VERSION_W);
+  con_attr(ATTR_TEXT);   puts16(u" - UEFI boot stage\r\n");
+  con_attr(ATTR_DIM);    puts16(u"  ==========================================\r\n\r\n");
+
+  if(wd) log_fail(u"Watchdog disarm refused (will still boot)");
+  else   log_ok(u"Watchdog disarmed");
+
+  con_attr(ATTR_BRIGHT);
+  if(ST->FirmwareVendor){
+    log_tag(u"  OK  ",ATTR_OK); puts16(u"Firmware: ");
+    puts16(ST->FirmwareVendor); puts16(u" rev ");
+    print_u(ST->FirmwareRevision>>16); puts16(u"."); print_u(ST->FirmwareRevision&0xFFFF);
+    puts16(u"\r\n");
+  }
 
   EFI_GUID gop_guid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
   EFI_GRAPHICS_OUTPUT_PROTOCOL *gop=NULL;
   if(BS->LocateProtocol(&gop_guid, NULL, (VOID**)&gop) || !gop){
-    puts16(u"No GOP. Cannot draw.\r\n");
+    log_fail(u"Graphics Output Protocol not found - cannot draw");
     for(;;) __asm__ __volatile__("hlt");
+  }
+  {
+    EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mi=gop->Mode->Info;
+    log_tag(u"  OK  ",ATTR_OK); puts16(u"Display ");
+    print_u(mi->HorizontalResolution); puts16(u"x"); print_u(mi->VerticalResolution);
+    switch(mi->PixelFormat){
+      case PixelBlueGreenRedReserved8BitPerColor: puts16(u" BGRX32"); break;
+      case PixelRedGreenBlueReserved8BitPerColor: puts16(u" RGBX32"); break;
+      case PixelBitMask:                          puts16(u" bitmask"); break;
+      case PixelBltOnly:                          puts16(u" blt-only"); break;
+      default: break;
+    }
+    puts16(u" (GOP)\r\n");
   }
 
   UINT8 *asset=NULL; UINTN sz=0;
   EFI_STATUS s=load_asset(image,&asset,&sz);
   if(s){
-    puts16(u"Asset load failed.\r\n");
-    /* still show a solid screen so we know GOP works */
-    EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mi=gop->Mode->Info;
-    if(mi->PixelFormat==PixelBltOnly){
-      EFI_GRAPHICS_OUTPUT_BLT_PIXEL c={0,0,120,0};
-      gop->Blt(gop,&c,EfiBltVideoFill,0,0,0,0,mi->HorizontalResolution,mi->VerticalResolution,0);
-    }else{
-      UINT32 *fb=(UINT32*)(UINTN)gop->Mode->FrameBufferBase;
-      UINT32 c=mkpix(mi,120,0,0);
-      for(UINT32 y=0;y<mi->VerticalResolution;y++){UINT32*r=fb+(UINTN)y*mi->PixelsPerScanLine;for(UINT32 x=0;x<mi->HorizontalResolution;x++)r[x]=c;}
-    }
+    log_tag(u" FAIL ",ATTR_FAIL); puts16(u"SACABASP.RAW load failed, status ");
+    print_hex(s); puts16(u"\r\n\r\n");
+    con_attr(ATTR_WARN);
+    puts16(u"  Boot halted so you can read the log. Machine untouched.\r\n");
     for(;;) __asm__ __volatile__("hlt");
   }
+  {
+    SbmpHeader *h=(SbmpHeader*)asset;
+    log_tag(u"  OK  ",ATTR_OK); puts16(u"SACABASP.RAW loaded: ");
+    print_u(h->width); puts16(u"x"); print_u(h->height); puts16(u" BGRA, ");
+    print_u(sz); puts16(u" bytes\r\n");
+  }
+  log_ok(u"Nothing written to any disk (live mode)");
+
+  con_attr(ATTR_WARN);
+  puts16(u"\r\n  Booting splash");
+  con_attr(ATTR_DIM);
+  for(int i=0;i<3;i++){ BS->Stall(650*1000); puts16(u" ."); }
+  BS->Stall(650*1000);
 
   draw(gop, asset);
+  draw_title(gop);
   draw_version(gop);
   /* Do NOT touch ConOut after drawing - the firmware text console would paint
    * over the framebuffer. Just idle so the Sacabambaspis stays on screen. */

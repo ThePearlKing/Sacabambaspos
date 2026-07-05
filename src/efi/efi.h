@@ -46,11 +46,15 @@ typedef struct {
 struct _EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL;
 typedef EFI_STATUS (EFIAPI *EFI_TEXT_RESET)(struct _EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL*, BOOLEAN);
 typedef EFI_STATUS (EFIAPI *EFI_TEXT_STRING)(struct _EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL*, CHAR16*);
+typedef EFI_STATUS (EFIAPI *EFI_TEXT_SET_ATTRIBUTE)(struct _EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL*, UINTN);
+typedef EFI_STATUS (EFIAPI *EFI_TEXT_CLEAR_SCREEN)(struct _EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL*);
 typedef struct _EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL {
   EFI_TEXT_RESET  Reset;
   EFI_TEXT_STRING OutputString;
-  VOID *TestString, *QueryMode, *SetMode, *SetAttribute;
-  VOID *ClearScreen, *SetCursorPosition, *EnableCursor, *Mode;
+  VOID *TestString, *QueryMode, *SetMode;
+  EFI_TEXT_SET_ATTRIBUTE SetAttribute;
+  EFI_TEXT_CLEAR_SCREEN  ClearScreen;
+  VOID *SetCursorPosition, *EnableCursor, *Mode;
 } EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL;
 
 /* ---- Simple Text Input ---- */
