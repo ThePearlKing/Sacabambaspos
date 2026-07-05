@@ -214,9 +214,11 @@ static const UINT8 *glyph(char c){
 
 /* Paint a string at (x0,y0) = top-left of its padded box. Read-modify-write
  * via GOP Blt so it composites over whatever is there and works on every
- * pixel format, including PixelBltOnly. Box: w=(8*len+4)*scale, h=12*scale. */
+ * pixel format, including PixelBltOnly. Box: w=(8*len+4)*scale, h=12*scale.
+ * Chars from index accent_at onward are drawn cyan instead of white; the
+ * dark outline/shadow is the same for both. */
 static void draw_text(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, const char *s,
-                      UINT32 scale, UINT32 x0, UINT32 y0){
+                      UINT32 scale, UINT32 x0, UINT32 y0, UINTN accent_at){
   EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mi=gop->Mode->Info;
   UINT32 sw=mi->HorizontalResolution, sh=mi->VerticalResolution;
   UINTN len=0; while(s[len]) len++;
@@ -229,13 +231,15 @@ static void draw_text(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, const char *s,
   if(BS->AllocatePool(EfiLoaderData,(UINTN)w*h*4,(VOID**)&buf)||!buf) return;
   if(gop->Blt(gop,buf,EfiBltVideoToBltBuffer,x0,y0,0,0,w,h,0)){ BS->FreePool(buf); return; }
 
-  /* pass 0 = drop shadow (dark, offset), pass 1 = white text */
+  /* pass 0 = drop shadow (dark, offset), pass 1 = colored text */
   for(int pass=0;pass<2;pass++){
     UINT32 off = pass ? 0 : (scale>3 ? scale/3 : 1);
-    EFI_GRAPHICS_OUTPUT_BLT_PIXEL col = pass
-      ? (EFI_GRAPHICS_OUTPUT_BLT_PIXEL){255,255,255,0}
-      : (EFI_GRAPHICS_OUTPUT_BLT_PIXEL){10,16,28,0};
     for(UINTN ci=0;ci<len;ci++){
+      EFI_GRAPHICS_OUTPUT_BLT_PIXEL col = !pass
+        ? (EFI_GRAPHICS_OUTPUT_BLT_PIXEL){10,16,28,0}            /* shadow */
+        : ci>=accent_at
+          ? (EFI_GRAPHICS_OUTPUT_BLT_PIXEL){255,255,0,0}         /* cyan   */
+          : (EFI_GRAPHICS_OUTPUT_BLT_PIXEL){255,255,255,0};      /* white  */
       const UINT8 *g=glyph(s[ci]); if(!g) continue;
       for(UINT32 gy=0;gy<8;gy++){
         UINT8 bits=g[gy]; if(!bits) continue;
@@ -266,7 +270,7 @@ static void draw_version(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop){
 
   UINT32 w=((UINT32)len*8+4)*scale, h=12*scale, margin=4*scale;
   if(w+margin>sw||h+margin>sh) return;
-  draw_text(gop, SBOS_VERSION, scale, sw-w-margin, sh-h-margin);
+  draw_text(gop, SBOS_VERSION, scale, sw-w-margin, sh-h-margin, (UINTN)-1);
 }
 
 /* SBOS_NAME, larger still, across the top starting left of centre. */
@@ -283,7 +287,7 @@ static void draw_title(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop){
   if(w+margin>sw||h+margin>sh) return;
   /* centre the text block on the left-middle of the screen (x = sw/4) */
   UINT32 x0 = sw/4 > w/2+margin ? sw/4-w/2 : margin;
-  draw_text(gop, SBOS_NAME, scale, x0, margin);
+  draw_text(gop, SBOS_NAME, scale, x0, margin, len-2);   /* "OS" in cyan */
 }
 
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st){
