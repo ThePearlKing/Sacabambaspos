@@ -1,6 +1,6 @@
 # SacabambaspOS
 
-The most epic operating system in all of eternal existence. In development.
+The most epic operating system in all of eternal existence.
 
 Stage 0 is a **from-scratch bootloader** that boots on modern hardware (UEFI:
 Mac, PC, laptop, virtual machine), detects the display, and paints the
@@ -80,6 +80,8 @@ Needs `qemu-system-x86` and `ovmf`.
    USB device. The Sacabambaspis appears.
 
 ## Scope / roadmap
+
+Early days — under active development.
 
 - [x] UEFI x86-64 boot + image display (Mac, PC, laptop, modern VM) — **verified in QEMU/OVMF**
 - [x] Best-effort UEFI ia32 (`BOOTIA32.EFI`) for 32-bit EFI Macs
