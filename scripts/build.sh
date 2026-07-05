@@ -61,7 +61,8 @@ echo "==> [4/5] ESP (FAT32, ${ESP_MB}MiB)"
 ESP="$BUILD/esp.img"
 rm -f "$ESP"
 dd if=/dev/zero of="$ESP" bs=1M count=$ESP_MB status=none
-mkfs.vfat -F 32 -n SACABASPOS -i 5ACABA05 "$ESP" >/dev/null   # fixed volume ID
+# FAT32 labels cap at 11 chars, so the full name loses its "OS" here.
+mkfs.vfat -F 32 -n SACABAMBASP -i 5ACABA05 "$ESP" >/dev/null   # fixed volume ID
 mmd   -i "$ESP" ::/EFI ::/EFI/BOOT
 mcopy -i "$ESP" "$BUILD/BOOTX64.EFI"  ::/EFI/BOOT/BOOTX64.EFI
 [ -f "$BUILD/BOOTIA32.EFI" ] && mcopy -i "$ESP" "$BUILD/BOOTIA32.EFI" ::/EFI/BOOT/BOOTIA32.EFI || true
