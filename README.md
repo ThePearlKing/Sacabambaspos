@@ -47,14 +47,24 @@ Needs: `gcc`, `binutils` (`ld`/`objcopy`), `python3` + `Pillow`, `mtools`,
 # -> build/sacabambaspos.img
 ```
 
-## Test in an emulator (no hardware needed)
+## Test in an emulator or VM (no hardware needed)
 
-Needs `qemu-system-x86` and `ovmf`.
+The bundled script uses QEMU (needs `qemu-system-x86` and `ovmf`):
 
 ```sh
 ./scripts/run-qemu.sh uefi gui     # opens a window; you should see the Sacabambaspis
 ./scripts/run-qemu.sh uefi         # headless -> build/shot-uefi.png
 ```
+
+`build/sacabambaspos.img` is a plain raw disk image, so any VM with UEFI
+firmware boots it too:
+
+- **VirtualBox**: enable EFI (Settings → System → Enable EFI), convert with
+  `VBoxManage convertfromraw build/sacabambaspos.img sacabambaspos.vdi`
+- **VMware**: `firmware = "efi"` in the .vmx; attach the image (or convert
+  with `qemu-img convert -O vmdk build/sacabambaspos.img sacabambaspos.vmdk`)
+- **UTM / virt-manager / Hyper-V (Gen 2)**: attach the raw image as a disk on
+  a UEFI/OVMF VM
 
 ## Burn to a USB stick
 
