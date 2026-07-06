@@ -3,7 +3,7 @@
 #define SBOS_VERSION_H
 
 #define SBOS_NAME    "SacabambaspOS"
-#define SBOS_VERSION "v0.3.0"
+#define SBOS_VERSION "v0.4.0"
 
 /* CHAR16 twin of SBOS_VERSION, derived - never maintained by hand. */
 #define SBOS_WIDE_(s)  u##s

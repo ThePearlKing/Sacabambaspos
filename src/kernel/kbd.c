@@ -121,51 +121,66 @@ static int pop(void){
   return v;
 }
 
-/* blocking read; the cli / sti;hlt pairing is atomic (hlt executes in the
- * sti interrupt shadow), so an IRQ landing between the empty check and the
- * halt cannot strand a keystroke in the buffer.
- * USB keyboards are pumped here too: usbkbd_poll() runs with interrupts on
- * (it's fully polled, xHCI raises no IRQ for us) and the PIT tick that ends
- * the hlt below re-polls it, so USB keys share the same <=10 ms bound. */
-int kbd_getc(void){
+/* run one scancode through the set-1 state machine; -1 = nothing to emit */
+static int decode(u8 sc){
+  if(sc == 0xE0){ ext = 1; return -1; }
+  if(ext){
+    ext = 0;
+    if(sc & 0x80) return -1;                  /* extended release */
+    switch(sc){
+      case 0x48: return KEY_UP;
+      case 0x50: return KEY_DOWN;
+      case 0x4B: return KEY_LEFT;
+      case 0x4D: return KEY_RIGHT;
+      case 0x53: return KEY_DEL;
+      case 0x47: return KEY_HOME;
+      case 0x4F: return KEY_END;
+      case 0x1C: return '\n';                 /* keypad enter */
+      default: return -1;
+    }
+  }
+  if(sc & 0x80){                              /* release */
+    u8 mk = sc & 0x7F;
+    if(mk == 0x2A) shift_l = 0;
+    if(mk == 0x36) shift_r = 0;
+    return -1;
+  }
+  if(sc == 0x2A){ shift_l = 1; return -1; }
+  if(sc == 0x36){ shift_r = 1; return -1; }
+  if(sc == 0x3A){ caps = !caps; return -1; }
+  if(sc >= 128) return -1;
+  int shift = shift_l | shift_r;
+  char c = shift ? map_hi[sc] : map_lo[sc];
+  if(!c) return -1;
+  if(caps && c >= 'a' && c <= 'z' && !shift) c += 'A'-'a';
+  else if(caps && c >= 'A' && c <= 'Z' && shift) c += 'a'-'A';
+  return c;
+}
+
+/* non-blocking read: pump USB and the 8042 once, -1 if no key is pending.
+ * Interrupts must be on (usbkbd_poll needs ticks + hlt-bounded waits). */
+int kbd_trygetc(void){
+  usbkbd_poll();
+  int uc = usbkbd_pop();
+  if(uc >= 0) return uc;
   for(;;){
-    usbkbd_poll();
-    int uc = usbkbd_pop();
-    if(uc >= 0) return uc;
     cli();
     kbd_poll();                 /* boards where IRQ1 never fires */
     int sc = pop();
-    if(sc < 0){ __asm__ __volatile__("sti; hlt"); continue; }
     sti();
+    if(sc < 0) return -1;
+    int k = decode((u8)sc);
+    if(k >= 0) return k;
+  }
+}
 
-    if(sc == 0xE0){ ext = 1; continue; }
-    if(ext){
-      ext = 0;
-      if(sc & 0x80) continue;                 /* extended release */
-      switch(sc){
-        case 0x48: return KEY_UP;
-        case 0x50: return KEY_DOWN;
-        case 0x4B: return KEY_LEFT;
-        case 0x4D: return KEY_RIGHT;
-        case 0x1C: return '\n';               /* keypad enter */
-        default: continue;
-      }
-    }
-    if(sc & 0x80){                            /* release */
-      u8 mk = sc & 0x7F;
-      if(mk == 0x2A) shift_l = 0;
-      if(mk == 0x36) shift_r = 0;
-      continue;
-    }
-    if(sc == 0x2A){ shift_l = 1; continue; }
-    if(sc == 0x36){ shift_r = 1; continue; }
-    if(sc == 0x3A){ caps = !caps; continue; }
-    if(sc >= 128) continue;
-    int shift = shift_l | shift_r;
-    char c = shift ? map_hi[sc] : map_lo[sc];
-    if(!c) continue;
-    if(caps && c >= 'a' && c <= 'z' && !shift) c += 'A'-'a';
-    else if(caps && c >= 'A' && c <= 'Z' && shift) c += 'a'-'A';
-    return c;
+/* blocking read. A key can slip in between the empty check and the hlt, but
+ * the PIT ends every hlt within 10 ms and the loop re-polls, so the worst
+ * case is one tick of latency - same bound the USB path always had. */
+int kbd_getc(void){
+  for(;;){
+    int c = kbd_trygetc();
+    if(c >= 0) return c;
+    hlt();
   }
 }

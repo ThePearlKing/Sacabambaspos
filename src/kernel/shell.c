@@ -24,6 +24,25 @@ static void cmd_help(int argc, char **argv){
   (void)argc; (void)argv;
   con_fg(C_LCYAN); con_puts("  SacabambaspOS shell builtins\n");
   list_cmds();
+  if(proc_count() > 0){
+    con_fg(C_LCYAN); con_puts("  /bin programs (ring 3) - see ");
+    con_fg(C_LGREEN); con_puts("ls\n");
+  }
+}
+
+static void cmd_ls(int argc, char **argv){
+  (void)argc; (void)argv;
+  int n = proc_count();
+  if(!n){
+    con_fg(C_DGREY); con_puts("  no BIN.PAK loaded - builtins only\n");
+    return;
+  }
+  con_fg(C_DGREY); con_puts("  /bin  (");
+  con_put_u64(n); con_puts(n==1 ? " program, ring 3)\n" : " programs, ring 3)\n");
+  for(int i = 0; i < n; i++){
+    con_fg(C_LGREEN); con_puts("  ");
+    con_puts(proc_name(i)); con_putc('\n');
+  }
 }
 
 static void cmd_clear(int argc, char **argv){ (void)argc;(void)argv; con_clear(); }
@@ -39,7 +58,7 @@ static void cmd_ver(int argc, char **argv){
   con_fg(C_WHITE);  con_puts("  Sacabambasp");
   con_fg(C_LCYAN);  con_puts("OS ");
   con_fg(C_YELLOW); con_puts(SBOS_VERSION);
-  con_fg(C_LGREY);  con_puts("  stage 1: kernel + shell\n");
+  con_fg(C_LGREY);  con_puts("  stage 2: ring-3 userland\n");
   con_fg(C_DGREY);  con_puts("  named after Sacabambaspis janvieri, 460 million years your senior\n");
 }
 
@@ -127,6 +146,7 @@ static void cmd_halt(int argc, char **argv){
 
 static const Cmd cmds[] = {
   {"help",   "list commands",                       cmd_help},
+  {"ls",     "list /bin programs",                  cmd_ls},
   {"clear",  "wipe the screen",                     cmd_clear},
   {"echo",   "print arguments",                     cmd_echo},
   {"ver",    "version + lineage",                   cmd_ver},
@@ -169,7 +189,9 @@ static int is_digit_tok(const char *s, size_t n){
   return 1;
 }
 
-/* redraw the line buffer after the prompt with coloring; pad clears leftovers */
+/* redraw the line buffer after the prompt with coloring; pad clears leftovers.
+ * Leaves the console cursor wherever the paint ended - read_line() places it
+ * at the edit position afterwards. */
 static void render_line(u32 px, u32 py, const char *b, size_t len, size_t pad){
   con_setxy(px, py);
   size_t i = 0; int first_done = 0;
@@ -179,7 +201,10 @@ static void render_line(u32 px, u32 py, const char *b, size_t len, size_t pad){
     if(quoted){ j++; while(j<len && b[j]!='"') j++; if(j<len) j++; }
     else while(j<len && b[j]!=' ') j++;
     u8 col;
-    if(!first_done){ col = find_cmd(b+i, j-i) ? C_LGREEN : C_LRED; first_done = 1; }
+    if(!first_done){
+      col = (find_cmd(b+i, j-i) || proc_has(b+i, j-i)) ? C_LGREEN : C_LRED;
+      first_done = 1;
+    }
     else if(quoted)                col = C_YELLOW;
     else if(b[i]=='-')             col = C_PINK;
     else if(is_digit_tok(b+i,j-i)) col = C_LCYAN;
@@ -189,20 +214,34 @@ static void render_line(u32 px, u32 py, const char *b, size_t len, size_t pad){
   }
   con_fg(C_LGREY);
   for(size_t k=0; k<pad; k++) con_putc(' ');
-  for(size_t k=0; k<pad; k++) con_putc('\b');
 }
 
 static void read_line(char *b, size_t max){
-  size_t len = 0;
+  size_t len = 0, cur = 0;          /* cur = edit position, 0..len */
   u32 px, py; con_getxy(&px, &py);
   hist_at = hist_n;
   for(;;){
+    con_setxy(px + cur, py);
     int c = kbd_getc();
-    if(c == '\n'){ b[len] = 0; con_putc('\n'); return; }
+    if(c == '\n'){ b[len] = 0; con_setxy(px + len, py); con_putc('\n'); return; }
     if(c == '\b'){
-      if(len){ len--; render_line(px, py, b, len, 1); }
+      if(!cur) continue;
+      memmove(b + cur - 1, b + cur, len - cur);
+      len--; cur--;
+      render_line(px, py, b, len, 1);
       continue;
     }
+    if(c == KEY_DEL){
+      if(cur >= len) continue;
+      memmove(b + cur, b + cur + 1, len - cur - 1);
+      len--;
+      render_line(px, py, b, len, 1);
+      continue;
+    }
+    if(c == KEY_LEFT) { if(cur) cur--;      continue; }
+    if(c == KEY_RIGHT){ if(cur<len) cur++;  continue; }
+    if(c == KEY_HOME) { cur = 0;            continue; }
+    if(c == KEY_END)  { cur = len;          continue; }
     if(c == KEY_UP || c == KEY_DOWN){
       int want = c==KEY_UP ? hist_at-1 : hist_at+1;
       if(want < 0 || want > hist_n) continue;
@@ -210,13 +249,15 @@ static void read_line(char *b, size_t max){
       if(want == hist_n) len = 0;
       else { len = strlen(hist[want]); memcpy(b, hist[want], len); }
       hist_at = want;
+      cur = len;
       render_line(px, py, b, len, old > len ? old-len : 0);
       continue;
     }
     if(c < 0x20 || c > 0x7E) continue;
     /* stay on one row: leave space for the trailing cursor cell */
     if(px + len + 2 >= con_cols() || len + 1 >= max) continue;
-    b[len++] = (char)c;
+    memmove(b + cur + 1, b + cur, len - cur);
+    b[cur++] = (char)c; len++;
     render_line(px, py, b, len, 0);
   }
 }
@@ -256,6 +297,7 @@ void shell_run_line(const char *line, int echo){
 
   const Cmd *c = find_cmd(argv[0], strlen(argv[0]));
   if(!c){
+    if(proc_exec(argv[0]) == 0) return;      /* ring-3 program from /bin */
     con_fg(C_LRED);  con_puts("  no such command: ");
     con_fg(C_WHITE); con_puts(argv[0]);
     con_fg(C_DGREY); con_puts("   (try ");

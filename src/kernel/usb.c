@@ -168,6 +168,8 @@ static int usage_to_key(u8 u, int shift){
     case 0x33: return shift ? ':' : ';';  case 0x34: return shift ? '"' : '\'';
     case 0x35: return shift ? '~' : '`';  case 0x36: return shift ? '<' : ',';
     case 0x37: return shift ? '>' : '.';  case 0x38: return shift ? '?' : '/';
+    case 0x4A: return KEY_HOME;  case 0x4C: return KEY_DEL;
+    case 0x4D: return KEY_END;
     case 0x4F: return KEY_RIGHT; case 0x50: return KEY_LEFT;
     case 0x51: return KEY_DOWN;  case 0x52: return KEY_UP;
     case 0x54: return '/'; case 0x55: return '*';
@@ -609,6 +611,7 @@ static int xhci_wait_clear(volatile u8 *reg, u32 mask, u32 ms){
 
 static int xhci_init_one(u64 bar){
   if(nhc >= MAX_CTRL) return 0;
+  vm_ensure_identity(bar, 0x10000);   /* BAR can sit above the 4 GiB map */
   Xhci *x = &hcs[nhc];
   memset(x, 0, sizeof(*x));
   x->base = (volatile u8*)bar;

@@ -868,6 +868,17 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st){
     }
   }
 
+  {  /* BIN.PAK userland archive is optional too */
+    CHAR16 *pk[]={u"\\SBOS\\BIN.PAK", u"\\BIN.PAK"};
+    UINT8 *pkb=NULL; UINTN pksz=0;
+    if(!load_file(image,pk,2,8*1024*1024,&pkb,&pksz)){
+      bootinfo.pak_base=(UINT64)(UINTN)pkb; bootinfo.pak_size=pksz;
+      log_ok(u"BIN.PAK loaded (userland)");
+    }else{
+      log_tag(u" INFO ",ATTR_DIM); puts16(u"no BIN.PAK (optional)\r\n");
+    }
+  }
+
   bootinfo.magic     = SBOS_BOOTINFO_MAGIC;
   bootinfo.fb_base   = gop->Mode->FrameBufferBase;
   bootinfo.fb_width  = mi->HorizontalResolution;

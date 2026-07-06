@@ -1,10 +1,9 @@
-/* kmain.c - SacabambaspOS kernel, stage 1.
+/* kmain.c - SacabambaspOS kernel, stage 2.
  *
  * The loader has already exited boot services; we own the machine. Set up
- * the CPU tables and drivers the shell needs and drop into it:
- *   GDT -> IDT/exceptions -> PIC remap -> PIT 100 Hz -> PS/2 kbd -> shell.
- * Still identity-mapped on the firmware's page tables; our own paging,
- * ring 3 and real userland come next stage. */
+ * the CPU tables, our own page tables (W^X + NX), the drivers, ring 3 with
+ * syscalls, and drop into the shell:
+ *   GDT -> IDT -> paging -> PIC remap -> PIT 100 Hz -> kbd -> ring 3 -> shell */
 #include "kernel.h"
 #include "../efi/version.h"
 
@@ -41,6 +40,12 @@ void *kalloc(size_t n){
   void *p = (void*)heap_at; heap_at += n;
   return memset(p, 0, n);
 }
+void *kalloc_page(void){
+  heap_at = (heap_at + 4095) & ~4095ULL;
+  if(heap_at > heap_end || 4096 > heap_end - heap_at) return NULL;
+  void *p = (void*)heap_at; heap_at += 4096;
+  return memset(p, 0, 4096);
+}
 u64 kalloc_used(void){ return heap_at - heap_start; }
 
 /* ---- GDT + TSS ---------------------------------------------------------- */
@@ -55,26 +60,32 @@ static struct tss64 tss;
 static u8 ist_df[8192]  __attribute__((aligned(16)));
 static u8 ist_nmi[8192] __attribute__((aligned(16)));
 
-static u64 gdt[5] __attribute__((aligned(16))) = {
+/* selector layout is load-bearing for syscall/sysret: STAR.SYSRET_CS points
+ * at user-data - 8, and the CPU derives user SS = +8, user CS = +16 from it */
+static u64 gdt[7] __attribute__((aligned(16))) = {
   0,
   0x00209A0000000000ULL,     /* 0x08: 64-bit code, ring 0 */
   0x0000920000000000ULL,     /* 0x10: data, ring 0 */
-  0, 0,                      /* 0x18: TSS descriptor (16 bytes), filled at init */
+  0x0000F20000000000ULL,     /* 0x18: data, ring 3 */
+  0x0020FA0000000000ULL,     /* 0x20: 64-bit code, ring 3 */
+  0, 0,                      /* 0x28: TSS descriptor (16 bytes), filled at init */
 };
 struct __attribute__((packed)) dtr { u16 limit; u64 base; };
 void gdt_flush(struct dtr *g);   /* entry.S */
+
+void set_rsp0(u64 sp){ tss.rsp0 = sp; }   /* ring3 -> ring0 interrupt stack */
 
 static void gdt_init(void){
   tss.iomap = sizeof(tss);                      /* no I/O bitmap */
   tss.ist[0] = (u64)ist_df  + sizeof(ist_df);   /* IST1: #DF */
   tss.ist[1] = (u64)ist_nmi + sizeof(ist_nmi);  /* IST2: NMI */
   u64 b = (u64)&tss, lim = sizeof(tss)-1;
-  gdt[3] = (lim & 0xFFFF) | ((b & 0xFFFFFF) << 16) | (0x89ULL << 40) |
+  gdt[5] = (lim & 0xFFFF) | ((b & 0xFFFFFF) << 16) | (0x89ULL << 40) |
            (((lim >> 16) & 0xF) << 48) | (((b >> 24) & 0xFF) << 56);
-  gdt[4] = b >> 32;
+  gdt[6] = b >> 32;
   struct dtr g = { sizeof(gdt)-1, (u64)gdt };
   gdt_flush(&g);
-  __asm__ __volatile__("ltr %0" :: "r"((u16)0x18));
+  __asm__ __volatile__("ltr %0" :: "r"((u16)0x28));
 }
 
 /* ---- IDT --------------------------------------------------------------- */
@@ -105,13 +116,6 @@ static void idt_init(void){
 static int lapic_x2;
 static volatile u32 *lapic_mmio;
 
-static inline u64 rdmsr(u32 m){
-  u32 lo, hi; __asm__ __volatile__("rdmsr":"=a"(lo),"=d"(hi):"c"(m));
-  return ((u64)hi<<32)|lo;
-}
-static inline void wrmsr(u32 m, u64 v){
-  __asm__ __volatile__("wrmsr"::"c"(m),"a"((u32)v),"d"((u32)(v>>32)));
-}
 static void lapic_write(u32 reg, u32 val){
   if(lapic_x2) wrmsr(0x800 + (reg>>4), val);
   else if(lapic_mmio) lapic_mmio[reg>>2] = val;
@@ -123,7 +127,7 @@ static u32 lapic_read(u32 reg){
 
 static int lapic_init(void){
   u32 a, b, c, d;
-  __asm__ __volatile__("cpuid":"=a"(a),"=b"(b),"=c"(c),"=d"(d):"a"(1));
+  cpuid(1, &a, &b, &c, &d);
   if(!(d & (1u<<9))) return 0;                  /* no local APIC */
   u64 base = rdmsr(0x1B);
   if(!(base & (1u<<11))) return 0;              /* globally disabled */
@@ -171,7 +175,7 @@ struct frame {
   u64 vec,err,rip,cs,rflags,rsp,ss;
 };
 
-static const char *exc_name(u64 v){
+const char *exc_name(u64 v){
   static const char *n[] = {
     "#DE divide","#DB debug","NMI","#BP breakpoint","#OF overflow",
     "#BR bound","#UD invalid opcode","#NM fpu","#DF double fault","x87 seg",
@@ -206,7 +210,11 @@ static void panic(struct frame *f){
 static u8 pic_isr(u16 cmdport){ outb(cmdport, 0x0B); return inb(cmdport); }
 
 void isr_common(struct frame *f){
-  if(f->vec < 32){ panic(f); return; }
+  if(f->vec < 32){
+    /* a fault while CPL was 3 is the process's problem, not the kernel's */
+    if(f->cs & 3){ proc_fault(f->vec, f->rip); return; }   /* never returns */
+    panic(f); return;
+  }
 
   if(f->vec >= 48) return;   /* firmware-armed LAPIC leftovers: LVTs are
                               * masked at init; nothing to EOI, never panic */
@@ -258,12 +266,14 @@ void kmain(SbosBootInfo *bi){
   con_fg(C_WHITE);  con_puts("  Sacabambasp");
   con_fg(C_LCYAN);  con_puts("OS ");
   con_fg(C_YELLOW); con_puts(SBOS_VERSION);
-  con_fg(C_DGREY);  con_puts("  -  kernel stage 1\n");
+  con_fg(C_DGREY);  con_puts("  -  kernel stage 2\n");
   con_fg(C_DGREY);  con_puts("  ==========================================\n\n");
 
   klog_ok("boot services exited, kernel owns the machine");
   gdt_init();  klog_ok("GDT + TSS loaded (fault stacks armed)");
   idt_init();  klog_ok("IDT armed, all 256 vectors");
+  if(paging_init(bi)) klog_ok("own page tables live: W^X kernel, NX data");
+  else klog_tagged(" WARN ", C_YELLOW, "paging init failed, firmware tables");
   if(lapic_init()) klog_ok("local APIC masked, virtual-wire mode set");
   else             klog_tagged(" INFO ", C_DGREY, "no local APIC (pre-APIC CPU)");
   pic_init();  klog_ok("PIC remapped to 0x20, IRQ0+IRQ1 unmasked");
@@ -272,6 +282,7 @@ void kmain(SbosBootInfo *bi){
   if(ps2) klog_ok("PS/2 keyboard ready");
   else klog_tagged(" INFO ", C_DGREY, "no PS/2 controller - using USB");
   sti();       klog_ok("interrupts enabled");
+  proc_init(bi);
   int uk = usbkbd_init();               /* needs ticks, so after sti */
   if(uk > 0)       klog_ok("USB keyboard ready (xHCI)");
   else if(uk == 0) klog_tagged(" INFO ", C_DGREY,

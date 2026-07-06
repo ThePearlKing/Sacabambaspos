@@ -13,9 +13,12 @@ PHDRS {
 SECTIONS {
   . = 0;
 
+  __text_start = .;
   .text : { *(.text .text.*) } :text
+  __text_end = .;
 
   . = ALIGN(4096);
+  __rodata_start = .;
   .rodata   : { *(.rodata .rodata.*) } :rodata
   .rela.dyn : { *(.rela.dyn .rela.*) } :rodata
   .dynamic  : { *(.dynamic) } :rodata :dynamic
@@ -23,10 +26,13 @@ SECTIONS {
   .dynstr   : { *(.dynstr) } :rodata
   .hash     : { *(.hash) } :rodata
   .gnu.hash : { *(.gnu.hash) } :rodata
+  __rodata_end = .;
 
   . = ALIGN(4096);
+  __data_start = .;
   .data : { *(.data .data.*) *(.got) *(.got.plt) } :data
   .bss  : { *(.bss .bss.*) *(COMMON) } :data
+  __kernel_end = .;
 
   /DISCARD/ : { *(.comment) *(.eh_frame) *(.note.*) *(.interp) }
 }

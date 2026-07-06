@@ -95,11 +95,106 @@ isr_common_stub:
     addq  $16, %rsp                 /* vec + err */
     iretq
 
+/* ---- ring 3 ------------------------------------------------------------
+ * user_enter(entry, user_rsp): save the kernel context setjmp-style, then
+ * iretq down to ring 3. Returns only when user_abort(code) longjmps back -
+ * from the exit syscall, or from the fault handler killing the process.
+ * The exit path abandons whatever stack it was on (syscall or exception
+ * frame); nothing up there owns resources, so that's clean by design. */
+.global user_enter
+user_enter:
+    pushq %rbx
+    pushq %rbp
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+    movq  %rsp, kctx_rsp(%rip)
+    pushq $0x1B                     /* user SS  (0x18 | RPL 3) */
+    pushq %rsi                      /* user stack */
+    pushq $0x202                    /* RFLAGS: IF set */
+    pushq $0x23                     /* user CS  (0x20 | RPL 3) */
+    pushq %rdi                      /* entry point */
+    xorl  %eax, %eax                /* leak nothing into ring 3 */
+    xorl  %ebx, %ebx
+    xorl  %ecx, %ecx
+    xorl  %edx, %edx
+    xorl  %esi, %esi
+    xorl  %edi, %edi
+    xorl  %ebp, %ebp
+    xorl  %r8d, %r8d
+    xorl  %r9d, %r9d
+    xorl  %r10d, %r10d
+    xorl  %r11d, %r11d
+    xorl  %r12d, %r12d
+    xorl  %r13d, %r13d
+    xorl  %r14d, %r14d
+    xorl  %r15d, %r15d
+    iretq
+
+.global user_abort
+user_abort:
+    movq  kctx_rsp(%rip), %rsp
+    movq  %rdi, %rax                /* user_enter's return value */
+    popq  %r15
+    popq  %r14
+    popq  %r13
+    popq  %r12
+    popq  %rbp
+    popq  %rbx
+    sti                             /* exception entry left IF off */
+    ret
+
+/* syscall arrives with rcx = user rip, r11 = user rflags, rsp = USER stack,
+ * IF masked by FMASK. Switch stacks first, then mirror Linux's contract:
+ * everything preserved except rax (result), rcx, r11. */
+.global syscall_entry
+syscall_entry:
+    movq  %rsp, usr_rsp(%rip)
+    leaq  sstack_top(%rip), %rsp
+    pushq usr_rsp(%rip)
+    pushq %rcx
+    pushq %r11
+    pushq %rdi
+    pushq %rsi
+    pushq %rdx
+    pushq %r8
+    pushq %r9
+    pushq %r10
+    subq  $8, %rsp                  /* 16-byte alignment for the call */
+    sti
+    movq  %rdx, %rcx                /* dispatch(nr, a, b, c) */
+    movq  %rsi, %rdx
+    movq  %rdi, %rsi
+    movq  %rax, %rdi
+    call  syscall_dispatch
+    cli
+    addq  $8, %rsp
+    popq  %r10
+    popq  %r9
+    popq  %r8
+    popq  %rdx
+    popq  %rsi
+    popq  %rdi
+    popq  %r11
+    popq  %rcx
+    popq  %rsp                      /* back onto the user stack */
+    sysretq
+
 .section .bss
 .align 16
 kstack:
     .skip 65536
 kstack_top:
+.align 16
+.global sstack_top
+sstack:                             /* ring0 stack for syscalls + ring3 IRQs */
+    .skip 16384
+sstack_top:
+kctx_rsp:
+    .skip 8
+usr_rsp:
+    .skip 8
 
 /* nothing here needs an executable stack */
 .section .note.GNU-stack,"",@progbits

@@ -13,7 +13,7 @@ mkdir -p "$BUILD"
 SOURCE_IMG="${1:-$ROOT/sacabambaspis.jpg}"
 ESP_MB=64
 
-echo "==> [1/6] assets: SACABASP.RAW + console font"
+echo "==> [1/7] assets: SACABASP.RAW + console font"
 python3 tools/mkasset.py "$SOURCE_IMG" "$BUILD/SACABASP.RAW" --max-w 1920 --max-h 1080
 python3 tools/mkfont.py "$BUILD/font8x16.h"
 
@@ -35,7 +35,7 @@ check_selfcontained() { # <.so>  -> fails loudly if the image needs a loader
   fi
 }
 
-echo "==> [2/6] UEFI x86-64: BOOTX64.EFI"
+echo "==> [2/7] UEFI x86-64: BOOTX64.EFI"
 gcc $CFLAGS -c "$SRC/efi/boot.c" -o "$BUILD/boot.x64.o"
 gcc $CFLAGS -c "$SRC/efi/reloc.S" -o "$BUILD/reloc.x64.o"
 ld $LDFLAGS "$BUILD/boot.x64.o" "$BUILD/reloc.x64.o" -o "$BUILD/boot.x64.so"
@@ -43,7 +43,7 @@ check_selfcontained "$BUILD/boot.x64.so"
 objcopy -j .text -j .data -j .reloc \
         --target efi-app-x86_64 "$BUILD/boot.x64.so" "$BUILD/BOOTX64.EFI"
 
-echo "==> [3/6] UEFI ia32: BOOTIA32.EFI (best-effort, for 32-bit EFI Macs)"
+echo "==> [3/7] UEFI ia32: BOOTIA32.EFI (best-effort, for 32-bit EFI Macs)"
 rm -f "$BUILD/BOOTIA32.EFI"   # never ship a stale one from a previous build
 # -malign-double: firmware lays out UINT64 struct fields 8-byte aligned on ia32
 if gcc -m32 -malign-double $CFLAGS -c "$SRC/efi/boot.c" -o "$BUILD/boot.ia32.o" 2>/dev/null \
@@ -58,11 +58,11 @@ else
   echo "    ia32 skipped (no 32-bit libs)"
 fi
 
-echo "==> [4/6] kernel: KERNEL.ELF (x86-64 static PIE)"
+echo "==> [4/7] kernel: KERNEL.ELF (x86-64 static PIE)"
 KCFLAGS="-ffreestanding -fpie -fno-stack-protector -fno-builtin -mno-red-zone \
  -mgeneral-regs-only -Wall -Wextra -O2 -I$BUILD"
 KOBJS=()
-for f in entry kmain console kbd usb shell; do
+for f in entry kmain paging proc console kbd usb shell; do
   ext=c; [ "$f" = entry ] && ext=S
   gcc $KCFLAGS -c "$SRC/kernel/$f.$ext" -o "$BUILD/k_$f.o"
   KOBJS+=("$BUILD/k_$f.o")
@@ -80,7 +80,27 @@ if [ -n "$(nm -D -u "$BUILD/KERNEL.ELF" 2>/dev/null)" ]; then
   nm -D -u "$BUILD/KERNEL.ELF" >&2; exit 1
 fi
 
-echo "==> [5/6] ESP (FAT32, ${ESP_MB}MiB)"
+echo "==> [5/7] userland: BIN.PAK"
+# Freestanding ring-3 programs: static ET_EXEC at the user window base.
+# -mcmodel=large because 0x700000000000 is way outside +-2 GiB;
+# -mgeneral-regs-only so no program depends on SSE state we don't init.
+UCFLAGS="-ffreestanding -fno-pie -fno-stack-protector -fno-builtin \
+ -mgeneral-regs-only -mcmodel=large -Wall -Wextra -O2 -Isrc/shared"
+gcc $UCFLAGS -c "$SRC/user/crt0.c" -o "$BUILD/u_crt0.o"
+UELFS=()
+for p in hello primes snake crash; do
+  gcc $UCFLAGS -c "$SRC/user/$p.c" -o "$BUILD/u_$p.o"
+  ld -nostdlib -static -T "$SRC/user/user.ld" \
+     "$BUILD/u_crt0.o" "$BUILD/u_$p.o" -o "$BUILD/u_$p.elf"
+  if readelf -rW "$BUILD/u_$p.elf" 2>/dev/null | grep -q 'R_X86_64_'; then
+    echo "ERROR: u_$p.elf has runtime relocations (must be static ET_EXEC)" >&2
+    exit 1
+  fi
+  UELFS+=("$BUILD/u_$p.elf")
+done
+python3 tools/mkpak.py "$BUILD/BIN.PAK" "${UELFS[@]}"
+
+echo "==> [6/7] ESP (FAT32, ${ESP_MB}MiB)"
 ESP="$BUILD/esp.img"
 rm -f "$ESP"
 dd if=/dev/zero of="$ESP" bs=1M count=$ESP_MB status=none
@@ -93,8 +113,9 @@ mcopy -i "$ESP" "$BUILD/SACABASP.RAW" ::/EFI/BOOT/SACABASP.RAW
 mcopy -i "$ESP" "$BUILD/KERNEL.ELF"   ::/KERNEL.ELF
 mcopy -i "$ESP" "$BUILD/KERNEL.ELF"   ::/EFI/BOOT/KERNEL.ELF
 mcopy -i "$ESP" "$SRC/init/INIT.RC"   ::/SBOS/INIT.RC
+mcopy -i "$ESP" "$BUILD/BIN.PAK"      ::/SBOS/BIN.PAK
 
-echo "==> [6/6] GPT disk image"
+echo "==> [7/7] GPT disk image"
 MBRBOOT=()
 [ -f "$BUILD/mbr.bin" ] && MBRBOOT=(--mbr-boot "$BUILD/mbr.bin")
 python3 tools/mkimage.py "$ESP" "$BUILD/sacabambaspos.img" "${MBRBOOT[@]}"
