@@ -60,6 +60,8 @@ static OlCell ol_log[OL_ROWS][OL_COLS];
 static UINT32 ol_row, ol_col;
 static UINTN  cur_attr = ATTR_TEXT;
 static int    ol_live;
+static int    g_ebs_tried;   /* after the first ExitBootServices attempt the
+                              * spec forbids ConOut - fence it in puts16 */
 static void   ol_flush(void);
 
 static void rec_putc(char c){
@@ -78,7 +80,7 @@ static void rec_putc(char c){
 }
 
 static void puts16(CHAR16 *s){
-  if(ST&&ST->ConOut&&!ol_live) ST->ConOut->OutputString(ST->ConOut, s);
+  if(ST&&ST->ConOut&&!ol_live&&!g_ebs_tried) ST->ConOut->OutputString(ST->ConOut, s);
   int nl=0;
   for(CHAR16 *p=s;*p;p++){ rec_putc(*p<128?(char)*p:'?'); if(*p==u'\n') nl=1; }
   if(nl&&ol_live) ol_flush();
@@ -86,7 +88,7 @@ static void puts16(CHAR16 *s){
 
 static void con_attr(UINTN a){
   cur_attr=a;
-  if(!ol_live && ST->ConOut && ST->ConOut->SetAttribute)
+  if(!ol_live && !g_ebs_tried && ST->ConOut && ST->ConOut->SetAttribute)
     ST->ConOut->SetAttribute(ST->ConOut,a);
 }
 
@@ -159,6 +161,7 @@ static EFI_STATUS load_asset(EFI_HANDLE image, UINT8 **out, UINTN *outsz){
   for(int i=0;i<3 && !f;i++){
     if(root->Open(root, &f, names[i], EFI_FILE_MODE_READ, 0)) f=NULL;
   }
+  root->Close(root);
   if(!f) return EFI_NOT_FOUND;
 
   /* read header */
@@ -208,6 +211,7 @@ static EFI_STATUS load_file(EFI_HANDLE image, CHAR16 **names, int nnames,
   s = fs->OpenVolume(fs, &root);                                   if(s) return s;
   for(int i=0;i<nnames && !f;i++)
     if(root->Open(root, &f, names[i], EFI_FILE_MODE_READ, 0)) f=NULL;
+  root->Close(root);
   if(!f) return EFI_NOT_FOUND;
 
   UINT8 *buf=NULL;
@@ -249,7 +253,12 @@ typedef struct { UINT64 r_offset,r_info; INT64 r_addend; } Elf64_Rela;
 #define R_X86_64_RELATIVE 8
 
 /* Load KERNEL.ELF anywhere in RAM (EfiLoaderCode so post-EBS NX policies
- * keep it executable) and apply its R_X86_64_RELATIVE relocations. */
+ * keep it executable) and apply its R_X86_64_RELATIVE relocations.
+ * Every header field that feeds pointer math is validated first: a corrupt
+ * file (bad flash, interrupted copy) must fail the load, not scribble over
+ * pre-boot memory. */
+#define KERNEL_SPAN_MAX (64ULL*1024*1024)
+
 static EFI_STATUS kernel_load(EFI_HANDLE image, UINT64 *entry_out, UINT64 *base_out){
   CHAR16 *names[]={u"\\KERNEL.ELF", u"KERNEL.ELF", u"\\EFI\\BOOT\\KERNEL.ELF"};
   UINT8 *file=NULL; UINTN fsz=0;
@@ -263,16 +272,26 @@ static EFI_STATUS kernel_load(EFI_HANDLE image, UINT64 *entry_out, UINT64 *base_
      eh->e_machine!=62 /*x86-64*/ || eh->e_type!=3 /*ET_DYN*/){
     BS->FreePool(file); return EFI_LOAD_ERROR;
   }
+  if(eh->e_phentsize!=sizeof(Elf64_Phdr) || eh->e_phnum==0 || eh->e_phnum>64 ||
+     eh->e_phoff>fsz ||
+     (UINT64)eh->e_phnum*sizeof(Elf64_Phdr) > fsz-eh->e_phoff){
+    BS->FreePool(file); return EFI_LOAD_ERROR;
+  }
 
   Elf64_Phdr *ph=(Elf64_Phdr*)(file+eh->e_phoff);
   UINT64 lo=~0ULL, hi=0;
   for(int i=0;i<eh->e_phnum;i++){
-    if(ph[i].p_type!=PT_LOAD) continue;
+    if(ph[i].p_type!=PT_LOAD || ph[i].p_memsz==0) continue;
+    if(ph[i].p_filesz>ph[i].p_memsz ||
+       ph[i].p_vaddr+ph[i].p_memsz<ph[i].p_vaddr){       /* wrap */
+      BS->FreePool(file); return EFI_LOAD_ERROR;
+    }
     if(ph[i].p_vaddr<lo) lo=ph[i].p_vaddr;
     if(ph[i].p_vaddr+ph[i].p_memsz>hi) hi=ph[i].p_vaddr+ph[i].p_memsz;
   }
-  if(hi<=lo){ BS->FreePool(file); return EFI_LOAD_ERROR; }
+  if(hi<=lo || hi-lo>KERNEL_SPAN_MAX){ BS->FreePool(file); return EFI_LOAD_ERROR; }
   lo &= ~0xFFFULL;
+  if(eh->e_entry<lo || eh->e_entry>=hi){ BS->FreePool(file); return EFI_LOAD_ERROR; }
 
   UINTN pages=(UINTN)((hi-lo+0xFFF)>>12);
   UINT64 base=0;
@@ -281,27 +300,38 @@ static EFI_STATUS kernel_load(EFI_HANDLE image, UINT64 *entry_out, UINT64 *base_
   UINT64 slide=base-lo;
   memset((void*)(UINTN)base,0,pages<<12);
 
+# define KLOAD_FAIL(st) do{ BS->FreePages(base,pages); BS->FreePool(file); return st; }while(0)
+
   for(int i=0;i<eh->e_phnum;i++){
-    if(ph[i].p_type!=PT_LOAD) continue;
-    if(ph[i].p_offset+ph[i].p_filesz>fsz){ BS->FreePool(file); return EFI_LOAD_ERROR; }
+    if(ph[i].p_type!=PT_LOAD || ph[i].p_memsz==0) continue;
+    if(ph[i].p_offset>fsz || ph[i].p_filesz>fsz-ph[i].p_offset)
+      KLOAD_FAIL(EFI_LOAD_ERROR);
     memcpy((void*)(UINTN)(slide+ph[i].p_vaddr), file+ph[i].p_offset, ph[i].p_filesz);
   }
 
-  /* relocations from PT_DYNAMIC (static PIE: R_X86_64_RELATIVE only) */
+  /* relocations from PT_DYNAMIC (static PIE: R_X86_64_RELATIVE only);
+   * the dynamic table and every reloc target must land inside [lo,hi) */
   for(int i=0;i<eh->e_phnum;i++){
     if(ph[i].p_type!=PT_DYNAMIC) continue;
+    if(ph[i].p_vaddr<lo || ph[i].p_memsz>hi-ph[i].p_vaddr)
+      KLOAD_FAIL(EFI_LOAD_ERROR);
     Elf64_Dyn *dyn=(Elf64_Dyn*)(UINTN)(slide+ph[i].p_vaddr);
-    UINT64 rela=0, relasz=0;
-    for(Elf64_Dyn *d=dyn; d->d_tag!=DT_NULL; d++){
-      if(d->d_tag==DT_RELA)   rela=slide+d->d_val;
-      if(d->d_tag==DT_RELASZ) relasz=d->d_val;
+    UINT64 ndyn=ph[i].p_memsz/sizeof(Elf64_Dyn);
+    UINT64 rela_v=0, relasz=0;
+    for(UINT64 j=0; j<ndyn && dyn[j].d_tag!=DT_NULL; j++){
+      if(dyn[j].d_tag==DT_RELA)   rela_v=dyn[j].d_val;
+      if(dyn[j].d_tag==DT_RELASZ) relasz=dyn[j].d_val;
     }
+    if(!relasz) continue;
+    if(rela_v<lo || relasz>hi-rela_v) KLOAD_FAIL(EFI_LOAD_ERROR);
     for(UINT64 off=0; off+sizeof(Elf64_Rela)<=relasz; off+=sizeof(Elf64_Rela)){
-      Elf64_Rela *r=(Elf64_Rela*)(UINTN)(rela+off);
-      if((r->r_info&0xFFFFFFFF)!=R_X86_64_RELATIVE){ BS->FreePool(file); return EFI_UNSUPPORTED; }
+      Elf64_Rela *r=(Elf64_Rela*)(UINTN)(slide+rela_v+off);
+      if((r->r_info&0xFFFFFFFF)!=R_X86_64_RELATIVE) KLOAD_FAIL(EFI_UNSUPPORTED);
+      if(r->r_offset<lo || r->r_offset+8>hi) KLOAD_FAIL(EFI_LOAD_ERROR);
       *(UINT64*)(UINTN)(slide+r->r_offset)=slide+r->r_addend;
     }
   }
+# undef KLOAD_FAIL
 
   UINT64 entry=slide+eh->e_entry;   /* read before the file buffer dies */
   BS->FreePool(file);
@@ -330,22 +360,25 @@ static UINT64 find_rsdp(void){
   return v1;
 }
 
-/* GetMemoryMap + ExitBootServices, retried: any allocation between the two
- * changes the map key, and the first EBS attempt itself may alter the map. */
+/* GetMemoryMap + ExitBootServices. UEFI spec 7.4: after the FIRST EBS call
+ * (even a failed one) the only boot services a loader may use are
+ * GetMemoryMap and ExitBootServices. So: allocate one oversized map buffer
+ * up front, and inside the loop touch nothing else. */
 static EFI_STATUS exit_boot_services(EFI_HANDLE image, UINT64 *total_ram){
   EFI_MEMORY_DESCRIPTOR *map=NULL;
-  UINTN msz=0,key=0,dsz=0; UINT32 dver=0;
-  for(int tries=0;tries<4;tries++){
-    msz=0;
-    BS->GetMemoryMap(&msz,NULL,&key,&dsz,&dver);       /* EFI_BUFFER_TOO_SMALL */
-    msz+=8*dsz;
-    if(map) BS->FreePool(map);
-    map=NULL;
-    if(BS->AllocatePool(EfiLoaderData,msz,(VOID**)&map)||!map) return EFI_LOAD_ERROR;
+  UINTN msz=0,key=0,dsz=0,bufsz; UINT32 dver=0;
+  BS->GetMemoryMap(&msz,NULL,&key,&dsz,&dver);         /* EFI_BUFFER_TOO_SMALL */
+  if(!dsz) return EFI_LOAD_ERROR;
+  bufsz=msz+16*dsz+512;                                /* slack: map may grow */
+  if(BS->AllocatePool(EfiLoaderData,bufsz,(VOID**)&map)||!map) return EFI_LOAD_ERROR;
+
+  for(int tries=0;tries<8;tries++){
+    msz=bufsz;
     if(BS->GetMemoryMap(&msz,map,&key,&dsz,&dver)) continue;
+    if(!dsz) break;                                    /* buggy firmware */
 
     UINT64 ram=0;
-    for(UINTN o=0;o<msz;o+=dsz){
+    for(UINTN o=0;o+dsz<=msz;o+=dsz){
       EFI_MEMORY_DESCRIPTOR *d=(EFI_MEMORY_DESCRIPTOR*)((UINT8*)map+o);
       switch(d->Type){
         case EfiLoaderCode: case EfiLoaderData:
@@ -357,6 +390,7 @@ static EFI_STATUS exit_boot_services(EFI_HANDLE image, UINT64 *total_ram){
     }
     *total_ram=ram;
 
+    g_ebs_tried=1;
     if(!ST->BootServices->ExitBootServices(image,key)) return EFI_SUCCESS;
   }
   return EFI_LOAD_ERROR;
@@ -560,9 +594,12 @@ static void ol_init(void){
   pl_w = g_sw*60/100; pl_h = g_sh*44/100;
   pl_x = g_sw*2/100;
   pl_y = g_sh - g_sh*3/100 - pl_h;
+  /* degenerate GOP modes: no room for even one glyph -> skip the overlay */
+  if(pl_w<=2*pl_pad+8*pl_scale || pl_h<=2*pl_pad+16*pl_scale) return;
   pl_cols=(pl_w-2*pl_pad)/(8*pl_scale);
   pl_rows=(pl_h-2*pl_pad)/(16*pl_scale);
   if(pl_cols>OL_COLS) pl_cols=OL_COLS;
+  if(pl_rows>OL_ROWS) pl_rows=OL_ROWS;
   if(BS->AllocatePool(EfiLoaderData,(UINTN)pl_w*pl_h*4,(VOID**)&ol_panel)||!ol_panel)
     { ol_panel=NULL; return; }
   ol_live=1;
@@ -850,6 +887,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st){
   }
   g_post_ebs=1;
   bootinfo.total_ram=total_ram;
+
+  /* the firmware IDT is still installed and IF may be set; a latched
+   * interrupt here would vector into torn-down firmware code */
+  __asm__ __volatile__("cli");
 
   /* kernel entry is SysV ABI; this call never returns */
   ((void (*)(SbosBootInfo*))(UINTN)kentry)(&bootinfo);

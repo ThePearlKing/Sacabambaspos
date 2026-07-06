@@ -1,9 +1,12 @@
 /* console.c - framebuffer text console for the SacabambaspOS kernel.
  *
- * Cell-grid model over a 32bpp linear framebuffer: every cell carries its
- * character and colors, rendering always goes cells -> pixels, so scrolling
- * never reads VRAM back (slow on real hardware, and firmware shadow-buffer
- * bugs taught us in stage 0 never to trust read-back). */
+ * Cell-grid model with a RAM shadow of the whole screen: glyphs render into
+ * the shadow (cached, fast), then dirty rectangles are copied to the real
+ * framebuffer with big sequential row writes. VRAM is uncached
+ * write-combining - per-pixel stores there made scrolling repaint the whole
+ * screen glyph by glyph (~megapixels of scattered MMIO per line); with the
+ * shadow, a scroll is one RAM memmove plus one linear blit. Nothing ever
+ * reads VRAM back (slow everywhere, stale on some firmware). */
 #include "kernel.h"
 #include "font8x16.h"
 
@@ -23,35 +26,13 @@ static u32 cols, rows;
 static u32 cx, cy;              /* cursor cell */
 static u8  cur_fg = C_LGREY, cur_bg = C_BLACK;
 static Cell *cells;
+static u32 *shadow;             /* fbw x fbh, row stride = fbw */
 static int cursor_on = 1;
 
-static u32 pix(u8 idx){
-  const u8 *p = PALETTE[idx & 15];
-  return fmt == SBOS_PIXFMT_RGBX ? ((u32)p[2]<<16)|((u32)p[1]<<8)|p[0]
-                                 : ((u32)p[0]<<16)|((u32)p[1]<<8)|p[2];
-}
-
-static void render_cell(u32 x, u32 y){
-  Cell *c = &cells[y*cols + x];
-  u32 fg = pix(c->fg), bg = pix(c->bg);
-  int invert = cursor_on && x == cx && y == cy;
-  if(invert){ u32 t = fg; fg = bg; bg = t; }
-  const unsigned char *g =
-    (c->ch >= FONT_FIRST && c->ch <= FONT_LAST) ? font8x16[c->ch - FONT_FIRST]
-                                                : font8x16[0];
-  u32 px0 = x*FONT_W, py0 = y*FONT_H;
-  for(u32 gy=0; gy<FONT_H; gy++){
-    u32 *row = fb + (u64)(py0+gy)*pitch + px0;
-    unsigned char bits = g[gy];
-    for(u32 gx=0; gx<FONT_W; gx++)
-      row[gx] = (bits & (0x80>>gx)) ? fg : bg;
-  }
-}
-
-static void render_row(u32 y){ for(u32 x=0; x<cols; x++) render_cell(x, y); }
-
 /* COM1 mirror: everything the console prints also goes to the serial port,
- * so headless QEMU runs (and real machines with a serial header) get a log */
+ * so headless QEMU runs (and real machines with a serial header) get a log.
+ * Boards without a UART float LSR at 0xFF, which reads as "ready" - the
+ * writes then go nowhere, harmlessly. */
 #define COM1 0x3F8
 static void serial_init(void){
   outb(COM1+1,0); outb(COM1+3,0x80); outb(COM1,1); outb(COM1+1,0);
@@ -62,47 +43,90 @@ static void serial_putc(char c){
   for(int i=0; i<10000 && !(inb(COM1+5)&0x20); i++);
   outb(COM1, c);
 }
+static void serial_puts(const char *s){ while(*s) serial_putc(*s++); }
 
-void con_init(SbosBootInfo *bi){
+static u32 pix(u8 idx){
+  const u8 *p = PALETTE[idx & 15];
+  return fmt == SBOS_PIXFMT_RGBX ? ((u32)p[2]<<16)|((u32)p[1]<<8)|p[0]
+                                 : ((u32)p[0]<<16)|((u32)p[1]<<8)|p[2];
+}
+
+/* copy a shadow rectangle to VRAM: sequential row bursts, WC-friendly */
+static void blit(u32 x, u32 y, u32 w, u32 h){
+  for(u32 r=0; r<h; r++)
+    memcpy(fb + (u64)(y+r)*pitch + x, shadow + (u64)(y+r)*fbw + x, (u64)w*4);
+}
+
+/* render one cell into the shadow (no blit - caller batches) */
+static void render_cell(u32 x, u32 y){
+  Cell *c = &cells[y*cols + x];
+  u32 fg = pix(c->fg), bg = pix(c->bg);
+  int invert = cursor_on && x == cx && y == cy;
+  if(invert){ u32 t = fg; fg = bg; bg = t; }
+  const unsigned char *g =
+    (c->ch >= FONT_FIRST && c->ch <= FONT_LAST) ? font8x16[c->ch - FONT_FIRST]
+                                                : font8x16[0];
+  u32 px0 = x*FONT_W, py0 = y*FONT_H;
+  for(u32 gy=0; gy<FONT_H; gy++){
+    u32 *row = shadow + (u64)(py0+gy)*fbw + px0;
+    unsigned char bits = g[gy];
+    for(u32 gx=0; gx<FONT_W; gx++)
+      row[gx] = (bits & (0x80>>gx)) ? fg : bg;
+  }
+}
+
+static void paint_cell(u32 x, u32 y){
+  render_cell(x, y);
+  blit(x*FONT_W, y*FONT_H, FONT_W, FONT_H);
+}
+
+int con_init(SbosBootInfo *bi){
   serial_init();
   fb    = (u32*)bi->fb_base;
   fbw   = bi->fb_width; fbh = bi->fb_height;
   pitch = bi->fb_pitch; fmt = bi->fb_format;
   cols  = fbw / FONT_W; rows = fbh / FONT_H;
-  cells = kalloc((u64)cols * rows * sizeof(Cell));
+  if(!cols || !rows){ serial_puts("console: display too small\n"); return 0; }
+  cells  = kalloc((u64)cols * rows * sizeof(Cell));
+  shadow = kalloc((u64)fbw * fbh * 4);
+  if(!cells || !shadow){ serial_puts("console: kernel heap too small\n"); return 0; }
   con_clear();
+  return 1;
 }
 
 u32 con_cols(void){ return cols; }
 u32 con_rows(void){ return rows; }
 void con_color(u8 fg, u8 bg){ cur_fg = fg; cur_bg = bg; }
 void con_fg(u8 fg){ cur_fg = fg; }
-void con_cursor(int on){ cursor_on = on; render_cell(cx, cy); }
+void con_cursor(int on){ cursor_on = on; paint_cell(cx, cy); }
 void con_getxy(u32 *x, u32 *y){ *x = cx; *y = cy; }
 
 void con_setxy(u32 x, u32 y){
   u32 ox = cx, oy = cy;
   cx = x < cols ? x : cols-1;
   cy = y < rows ? y : rows-1;
-  render_cell(ox, oy);          /* erase old cursor */
-  render_cell(cx, cy);
+  paint_cell(ox, oy);           /* erase old cursor */
+  paint_cell(cx, cy);
 }
 
 void con_clear(void){
   for(u32 i=0; i<cols*rows; i++) cells[i] = (Cell){' ', cur_fg, cur_bg};
   cx = cy = 0;
-  /* paint the whole screen, including the right/bottom fringe cells miss */
+  /* paint the whole shadow, including the right/bottom fringe cells miss */
   u32 bg = pix(cur_bg);
-  for(u32 y=0; y<fbh; y++){
-    u32 *row = fb + (u64)y*pitch;
-    for(u32 x=0; x<fbw; x++) row[x] = bg;
-  }
+  for(u64 i=0; i<(u64)fbw*fbh; i++) shadow[i] = bg;
+  blit(0, 0, fbw, fbh);
 }
 
 static void scroll(void){
   memmove(cells, cells + cols, (u64)(rows-1)*cols*sizeof(Cell));
   for(u32 x=0; x<cols; x++) cells[(rows-1)*cols + x] = (Cell){' ', cur_fg, cur_bg};
-  for(u32 y=0; y<rows; y++) render_row(y);
+  /* pixels move in RAM; the empty last band is filled, then one linear blit */
+  u32 grid_h = rows*FONT_H;
+  memmove(shadow, shadow + (u64)FONT_H*fbw, (u64)(grid_h-FONT_H)*fbw*4);
+  u32 bg = pix(cur_bg);
+  for(u64 i=(u64)(grid_h-FONT_H)*fbw; i<(u64)grid_h*fbw; i++) shadow[i] = bg;
+  blit(0, 0, fbw, grid_h);
 }
 
 void con_putc(char c){
@@ -110,14 +134,16 @@ void con_putc(char c){
   u32 ox = cx, oy = cy;
   if(c == '\n'){ cx = 0; cy++; }
   else if(c == '\r'){ cx = 0; }
-  else if(c == '\b'){ if(cx) cx--; cells[cy*cols+cx] = (Cell){' ', cur_fg, cur_bg}; }
+  else if(c == '\b'){
+    if(cx){ cx--; cells[cy*cols+cx] = (Cell){' ', cur_fg, cur_bg}; }
+  }
   else{
     cells[cy*cols+cx] = (Cell){c, cur_fg, cur_bg};
     if(++cx >= cols){ cx = 0; cy++; }
   }
   if(cy >= rows){ cy = rows-1; scroll(); oy = cy; ox = cx; }
-  if(ox != cx || oy != cy) render_cell(ox, oy);   /* repaint cell cursor left */
-  render_cell(cx, cy);
+  if(ox != cx || oy != cy) paint_cell(ox, oy);   /* repaint cell cursor left */
+  paint_cell(cx, cy);
 }
 
 void con_puts(const char *s){ while(*s) con_putc(*s++); }

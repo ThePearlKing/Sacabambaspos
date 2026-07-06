@@ -38,7 +38,7 @@ enum {
   C_BLACK, C_BLUE, C_GREEN, C_CYAN, C_RED, C_MAGENTA, C_BROWN, C_LGREY,
   C_DGREY, C_LBLUE, C_LGREEN, C_LCYAN, C_LRED, C_PINK, C_YELLOW, C_WHITE,
 };
-void con_init(SbosBootInfo *bi);
+int  con_init(SbosBootInfo *bi);        /* 0 = unusable fb/heap (reason on serial) */
 void con_color(u8 fg, u8 bg);
 void con_fg(u8 fg);
 void con_putc(char c);
@@ -60,7 +60,7 @@ void klog_tagged(const char *tag, u8 tagcolor, const char *m);
 extern volatile u64 ticks;              /* PIT, 100 Hz */
 
 /* ---- keyboard (kbd.c) ---- */
-void kbd_init(void);
+int  kbd_init(void);                    /* 0 = no PS/2 controller */
 void kbd_irq(void);                     /* called from IRQ1 stub */
 int  kbd_getc(void);                    /* blocking, returns ASCII (or KEY_*) */
 #define KEY_UP    0x100

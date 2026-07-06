@@ -102,9 +102,18 @@ static void cmd_reboot(int argc, char **argv){
   (void)argc;(void)argv;
   con_fg(C_YELLOW); con_puts("  rebooting...\n");
   for(volatile int i=0;i<20000000;i++);
-  u8 t = inb(0x64);                       /* 8042 pulse reset line */
-  while(t & 2) t = inb(0x64);
-  outb(0x64, 0xFE);
+  /* 8042 pulse reset - skip on boards without a controller (status floats
+   * 0xFF on Intel Macs etc.), and bound the ready wait either way */
+  u8 t = inb(0x64);
+  if(t != 0xFF){
+    for(int i=0; i<100000 && (t & 2); i++) t = inb(0x64);
+    outb(0x64, 0xFE);
+    for(volatile int i=0;i<20000000;i++);
+  }
+  /* still running: force a triple fault (null IDT + breakpoint) */
+  struct __attribute__((packed)) { u16 l; u64 b; } z = {0,0};
+  cli();
+  __asm__ __volatile__("lidt %0; int3" :: "m"(z));
   for(;;) hlt();
 }
 
@@ -222,14 +231,20 @@ void shell_run_line(const char *line, int echo){
   /* tokenize in place; honour double quotes */
   char *argv[16]; int argc = 0;
   char *p = buf;
-  while(*p && argc < 16){
+  int overflow = 0;
+  while(*p){
     while(*p==' ') p++;
     if(!*p) break;
+    if(argc == 16){ overflow = 1; break; }
     if(*p=='"'){ argv[argc++] = ++p; while(*p && *p!='"') p++; }
     else { argv[argc++] = p; while(*p && *p!=' ') p++; }
     if(*p) *p++ = 0;
   }
   if(!argc) return;
+  if(overflow){
+    con_fg(C_LRED); con_puts("  too many arguments (16 max)\n");
+    return;
+  }
 
   if(echo){
     put_prompt();

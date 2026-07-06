@@ -165,7 +165,7 @@ typedef struct {
   VOID *RaiseTPL, *RestoreTPL;
   /* Memory */
   EFI_STATUS (EFIAPI *AllocatePages)(EFI_ALLOCATE_TYPE, UINTN, UINTN, UINT64*);
-  VOID *FreePages;
+  EFI_STATUS (EFIAPI *FreePages)(UINT64, UINTN);
   EFI_STATUS (EFIAPI *GetMemoryMap)(UINTN *MapSize, EFI_MEMORY_DESCRIPTOR *Map,
                                     UINTN *MapKey, UINTN *DescSize, UINT32 *DescVer);
   EFI_STATUS (EFIAPI *AllocatePool)(UINTN, UINTN, VOID**);

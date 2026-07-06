@@ -37,24 +37,44 @@ static void kalloc_init(SbosBootInfo *bi){
 }
 void *kalloc(size_t n){
   heap_at = (heap_at + 15) & ~15ULL;
-  if(heap_at + n > heap_end) return NULL;
+  if(heap_at > heap_end || n > heap_end - heap_at) return NULL;   /* no wrap */
   void *p = (void*)heap_at; heap_at += n;
   return memset(p, 0, n);
 }
 u64 kalloc_used(void){ return heap_at - heap_start; }
 
-/* ---- GDT --------------------------------------------------------------- */
-static u64 gdt[3] __attribute__((aligned(16))) = {
+/* ---- GDT + TSS ---------------------------------------------------------- */
+/* The TSS gives #DF and NMI their own known-good stacks (IST): a fault on a
+ * corrupted kernel stack then still reaches the panic screen instead of
+ * triple-faulting into a silent reboot. */
+struct __attribute__((packed)) tss64 {
+  u32 r0; u64 rsp0, rsp1, rsp2; u64 r1;
+  u64 ist[7]; u64 r2; u16 r3, iomap;
+};
+static struct tss64 tss;
+static u8 ist_df[8192]  __attribute__((aligned(16)));
+static u8 ist_nmi[8192] __attribute__((aligned(16)));
+
+static u64 gdt[5] __attribute__((aligned(16))) = {
   0,
   0x00209A0000000000ULL,     /* 0x08: 64-bit code, ring 0 */
   0x0000920000000000ULL,     /* 0x10: data, ring 0 */
+  0, 0,                      /* 0x18: TSS descriptor (16 bytes), filled at init */
 };
 struct __attribute__((packed)) dtr { u16 limit; u64 base; };
 void gdt_flush(struct dtr *g);   /* entry.S */
 
 static void gdt_init(void){
+  tss.iomap = sizeof(tss);                      /* no I/O bitmap */
+  tss.ist[0] = (u64)ist_df  + sizeof(ist_df);   /* IST1: #DF */
+  tss.ist[1] = (u64)ist_nmi + sizeof(ist_nmi);  /* IST2: NMI */
+  u64 b = (u64)&tss, lim = sizeof(tss)-1;
+  gdt[3] = (lim & 0xFFFF) | ((b & 0xFFFFFF) << 16) | (0x89ULL << 40) |
+           (((lim >> 16) & 0xF) << 48) | (((b >> 24) & 0xFF) << 56);
+  gdt[4] = b >> 32;
   struct dtr g = { sizeof(gdt)-1, (u64)gdt };
   gdt_flush(&g);
+  __asm__ __volatile__("ltr %0" :: "r"((u16)0x18));
 }
 
 /* ---- IDT --------------------------------------------------------------- */
@@ -63,30 +83,62 @@ struct __attribute__((packed)) idt_ent {
 };
 static struct idt_ent idt[256] __attribute__((aligned(16)));
 
-#define ISR(n) extern void isr##n(void);
-ISR(0) ISR(1) ISR(2) ISR(3) ISR(4) ISR(5) ISR(6) ISR(7)
-ISR(8) ISR(9) ISR(10) ISR(11) ISR(12) ISR(13) ISR(14) ISR(15)
-ISR(16) ISR(17) ISR(18) ISR(19) ISR(20) ISR(21) ISR(22) ISR(23)
-ISR(24) ISR(25) ISR(26) ISR(27) ISR(28) ISR(29) ISR(30) ISR(31)
-ISR(32) ISR(33) ISR(34) ISR(35) ISR(36) ISR(37) ISR(38) ISR(39)
-ISR(40) ISR(41) ISR(42) ISR(43) ISR(44) ISR(45) ISR(46) ISR(47)
-#undef ISR
+extern char vector_stubs[];      /* entry.S: 256 stubs, 16 bytes apart */
 
-static void idt_set(int v, void (*fn)(void)){
-  u64 a = (u64)fn;
-  idt[v] = (struct idt_ent){ a & 0xFFFF, 0x08, 0, 0x8E, (a>>16)&0xFFFF, a>>32, 0 };
+static void idt_set(int v, u64 a, u8 ist){
+  idt[v] = (struct idt_ent){ a & 0xFFFF, 0x08, ist, 0x8E, (a>>16)&0xFFFF, a>>32, 0 };
 }
 
 static void idt_init(void){
-  void (*stubs[48])(void) = {
-    isr0,isr1,isr2,isr3,isr4,isr5,isr6,isr7,isr8,isr9,isr10,isr11,
-    isr12,isr13,isr14,isr15,isr16,isr17,isr18,isr19,isr20,isr21,isr22,isr23,
-    isr24,isr25,isr26,isr27,isr28,isr29,isr30,isr31,isr32,isr33,isr34,isr35,
-    isr36,isr37,isr38,isr39,isr40,isr41,isr42,isr43,isr44,isr45,isr46,isr47,
-  };
-  for(int i=0; i<48; i++) idt_set(i, stubs[i]);
+  for(int i=0; i<256; i++)
+    idt_set(i, (u64)vector_stubs + (u64)i*16,
+            i==8 ? 1 : i==2 ? 2 : 0);           /* #DF -> IST1, NMI -> IST2 */
   struct dtr d = { sizeof(idt)-1, (u64)idt };
   __asm__ __volatile__("lidt %0" :: "m"(d));
+}
+
+/* ---- local APIC ---------------------------------------------------------
+ * Firmware may hand off with LVT sources (timer, thermal, error) armed.
+ * Mask them all and program virtual-wire mode (LINT0 = ExtINT so the 8259
+ * lines reach the CPU, LINT1 = NMI) before enabling interrupts. Handles
+ * both xAPIC (MMIO) and x2APIC (MSR) handoff states. */
+static int lapic_x2;
+static volatile u32 *lapic_mmio;
+
+static inline u64 rdmsr(u32 m){
+  u32 lo, hi; __asm__ __volatile__("rdmsr":"=a"(lo),"=d"(hi):"c"(m));
+  return ((u64)hi<<32)|lo;
+}
+static inline void wrmsr(u32 m, u64 v){
+  __asm__ __volatile__("wrmsr"::"c"(m),"a"((u32)v),"d"((u32)(v>>32)));
+}
+static void lapic_write(u32 reg, u32 val){
+  if(lapic_x2) wrmsr(0x800 + (reg>>4), val);
+  else if(lapic_mmio) lapic_mmio[reg>>2] = val;
+}
+static u32 lapic_read(u32 reg){
+  if(lapic_x2) return (u32)rdmsr(0x800 + (reg>>4));
+  return lapic_mmio ? lapic_mmio[reg>>2] : 0;
+}
+
+static int lapic_init(void){
+  u32 a, b, c, d;
+  __asm__ __volatile__("cpuid":"=a"(a),"=b"(b),"=c"(c),"=d"(d):"a"(1));
+  if(!(d & (1u<<9))) return 0;                  /* no local APIC */
+  u64 base = rdmsr(0x1B);
+  if(!(base & (1u<<11))) return 0;              /* globally disabled */
+  lapic_x2 = !!(base & (1u<<10));
+  lapic_mmio = (volatile u32*)(base & 0x000FFFFFFFFFF000ULL);
+
+  u32 maxlvt = (lapic_read(0x30) >> 16) & 0xFF;
+  lapic_write(0xF0, 0x100 | 0xFF);              /* soft-enable, spurious vec 0xFF */
+  lapic_write(0x320, 1u<<16);                   /* LVT timer: masked */
+  if(maxlvt >= 4) lapic_write(0x340, 1u<<16);   /* LVT perf: masked */
+  if(maxlvt >= 5) lapic_write(0x330, 1u<<16);   /* LVT thermal: masked */
+  lapic_write(0x370, 1u<<16);                   /* LVT error: masked */
+  lapic_write(0x350, 0x700);                    /* LINT0 = ExtINT (8259 wire) */
+  lapic_write(0x360, 0x400);                    /* LINT1 = NMI */
+  return 1;
 }
 
 /* ---- PIC + PIT ---------------------------------------------------------- */
@@ -150,11 +202,26 @@ static void panic(struct frame *f){
   for(;;) hlt();
 }
 
+/* read a PIC's in-service register (OCW3) */
+static u8 pic_isr(u16 cmdport){ outb(cmdport, 0x0B); return inb(cmdport); }
+
 void isr_common(struct frame *f){
   if(f->vec < 32){ panic(f); return; }
+
+  if(f->vec >= 48) return;   /* firmware-armed LAPIC leftovers: LVTs are
+                              * masked at init; nothing to EOI, never panic */
+
+  /* spurious IRQ7/IRQ15: the 8259 raises them on line glitches with no
+   * in-service bit set - EOIing a phantom would eat a real interrupt */
+  if(f->vec == 39 && !(pic_isr(PIC1_CMD) & 0x80)) return;
+  if(f->vec == 47 && !(pic_isr(PIC2_CMD) & 0x80)){
+    outb(PIC1_CMD, 0x20);    /* master still saw the cascade line */
+    return;
+  }
+
   if(f->vec == 32) ticks++;
   else if(f->vec == 33) kbd_irq();
-  /* EOI */
+
   if(f->vec >= 40) outb(PIC2_CMD, 0x20);
   outb(PIC1_CMD, 0x20);
 }
@@ -185,7 +252,7 @@ void kmain(SbosBootInfo *bi){
   if(!bi || bi->magic != SBOS_BOOTINFO_MAGIC) for(;;) hlt();
   g_bi = bi;
   kalloc_init(bi);
-  con_init(bi);
+  if(!con_init(bi)) for(;;) hlt();   /* reason already on serial */
 
   con_putc('\n');
   con_fg(C_WHITE);  con_puts("  Sacabambasp");
@@ -195,11 +262,15 @@ void kmain(SbosBootInfo *bi){
   con_fg(C_DGREY);  con_puts("  ==========================================\n\n");
 
   klog_ok("boot services exited, kernel owns the machine");
-  gdt_init();  klog_ok("GDT loaded (own descriptors, firmware's gone)");
-  idt_init();  klog_ok("IDT armed, 32 exceptions + 16 IRQs");
+  gdt_init();  klog_ok("GDT + TSS loaded (fault stacks armed)");
+  idt_init();  klog_ok("IDT armed, all 256 vectors");
+  if(lapic_init()) klog_ok("local APIC masked, virtual-wire mode set");
+  else             klog_tagged(" INFO ", C_DGREY, "no local APIC (pre-APIC CPU)");
   pic_init();  klog_ok("PIC remapped to 0x20, IRQ0+IRQ1 unmasked");
   pit_init();  klog_ok("PIT ticking at 100 Hz");
-  kbd_init();  klog_ok("PS/2 keyboard ready");
+  if(kbd_init()) klog_ok("PS/2 keyboard ready");
+  else klog_tagged(" WARN ", C_YELLOW,
+                   "no PS/2 controller - USB keyboard needs firmware legacy mode");
   sti();       klog_ok("interrupts enabled");
 
   con_fg(C_DGREY); con_puts("  [ MEM  ] ");
