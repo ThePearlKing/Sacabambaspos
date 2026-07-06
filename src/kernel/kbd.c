@@ -123,9 +123,15 @@ static int pop(void){
 
 /* blocking read; the cli / sti;hlt pairing is atomic (hlt executes in the
  * sti interrupt shadow), so an IRQ landing between the empty check and the
- * halt cannot strand a keystroke in the buffer */
+ * halt cannot strand a keystroke in the buffer.
+ * USB keyboards are pumped here too: usbkbd_poll() runs with interrupts on
+ * (it's fully polled, xHCI raises no IRQ for us) and the PIT tick that ends
+ * the hlt below re-polls it, so USB keys share the same <=10 ms bound. */
 int kbd_getc(void){
   for(;;){
+    usbkbd_poll();
+    int uc = usbkbd_pop();
+    if(uc >= 0) return uc;
     cli();
     kbd_poll();                 /* boards where IRQ1 never fires */
     int sc = pop();

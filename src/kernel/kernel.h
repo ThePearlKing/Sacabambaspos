@@ -17,6 +17,8 @@ typedef unsigned long       size_t;
 /* ---- port I/O ---- */
 static inline void outb(u16 p, u8 v){ __asm__ __volatile__("outb %0,%1"::"a"(v),"Nd"(p)); }
 static inline u8   inb(u16 p){ u8 v; __asm__ __volatile__("inb %1,%0":"=a"(v):"Nd"(p)); return v; }
+static inline void outl(u16 p, u32 v){ __asm__ __volatile__("outl %0,%1"::"a"(v),"Nd"(p)); }
+static inline u32  inl(u16 p){ u32 v; __asm__ __volatile__("inl %1,%0":"=a"(v):"Nd"(p)); return v; }
 static inline void io_wait(void){ outb(0x80, 0); }
 static inline void cli(void){ __asm__ __volatile__("cli"); }
 static inline void sti(void){ __asm__ __volatile__("sti"); }
@@ -67,6 +69,13 @@ int  kbd_getc(void);                    /* blocking, returns ASCII (or KEY_*) */
 #define KEY_DOWN  0x101
 #define KEY_LEFT  0x102
 #define KEY_RIGHT 0x103
+
+/* ---- USB keyboard, xHCI (usb.c) ----
+ * Polled driver: no IRQ line needed, kbd_getc pumps it. All three calls are
+ * main-thread only (never from an interrupt handler). */
+int  usbkbd_init(void);   /* after sti (needs ticks); -1 = no xHCI, else #kbds */
+void usbkbd_poll(void);   /* pump event rings, hotplug; interrupts must be on */
+int  usbkbd_pop(void);    /* -1 = empty, else ASCII / KEY_* */
 
 /* ---- shell (shell.c) ---- */
 void shell_run_line(const char *line, int echo);   /* execute one command */

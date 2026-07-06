@@ -62,7 +62,7 @@ echo "==> [4/6] kernel: KERNEL.ELF (x86-64 static PIE)"
 KCFLAGS="-ffreestanding -fpie -fno-stack-protector -fno-builtin -mno-red-zone \
  -mgeneral-regs-only -Wall -Wextra -O2 -I$BUILD"
 KOBJS=()
-for f in entry kmain console kbd shell; do
+for f in entry kmain console kbd usb shell; do
   ext=c; [ "$f" = entry ] && ext=S
   gcc $KCFLAGS -c "$SRC/kernel/$f.$ext" -o "$BUILD/k_$f.o"
   KOBJS+=("$BUILD/k_$f.o")

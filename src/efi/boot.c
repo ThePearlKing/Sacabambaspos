@@ -591,7 +591,7 @@ static void ol_init(void){
   if(!g_frame) return;                       /* splash fell back: no overlay */
   pl_scale = g_sh/800; if(pl_scale<1) pl_scale=1; if(pl_scale>3) pl_scale=3;
   pl_pad   = 12*pl_scale;
-  pl_w = g_sw*60/100; pl_h = g_sh*44/100;
+  pl_w = g_sw*30/100; pl_h = g_sh*44/100;
   pl_x = g_sw*2/100;
   pl_y = g_sh - g_sh*3/100 - pl_h;
   /* degenerate GOP modes: no room for even one glyph -> skip the overlay */

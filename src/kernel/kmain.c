@@ -268,10 +268,16 @@ void kmain(SbosBootInfo *bi){
   else             klog_tagged(" INFO ", C_DGREY, "no local APIC (pre-APIC CPU)");
   pic_init();  klog_ok("PIC remapped to 0x20, IRQ0+IRQ1 unmasked");
   pit_init();  klog_ok("PIT ticking at 100 Hz");
-  if(kbd_init()) klog_ok("PS/2 keyboard ready");
-  else klog_tagged(" WARN ", C_YELLOW,
-                   "no PS/2 controller - USB keyboard needs firmware legacy mode");
+  int ps2 = kbd_init();
+  if(ps2) klog_ok("PS/2 keyboard ready");
+  else klog_tagged(" INFO ", C_DGREY, "no PS/2 controller - using USB");
   sti();       klog_ok("interrupts enabled");
+  int uk = usbkbd_init();               /* needs ticks, so after sti */
+  if(uk > 0)       klog_ok("USB keyboard ready (xHCI)");
+  else if(uk == 0) klog_tagged(" INFO ", C_DGREY,
+                               "xHCI up, no USB keyboard yet (hotplug works)");
+  else if(!ps2)    klog_tagged(" WARN ", C_YELLOW,
+                               "no keyboard found (no PS/2, no xHCI)");
 
   con_fg(C_DGREY); con_puts("  [ MEM  ] ");
   con_fg(C_LGREY); con_puts("usable RAM ");
