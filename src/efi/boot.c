@@ -841,8 +841,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st){
   log_tag(u"  OK  ",ATTR_OK); puts16(u"KERNEL.ELF relocated to ");
   print_hex(kbase); puts16(u"\r\n");
 
-  /* kernel heap: EfiLoaderData pages stay ours after ExitBootServices */
-  UINT64 heap=0; UINTN heap_pages=32*256;                 /* 32 MiB, halve on failure */
+  /* kernel heap: EfiLoaderData pages stay ours after ExitBootServices.
+   * 64 MiB because the console keeps a full-screen shadow buffer - at 4K
+   * that alone is ~33 MiB - and the halving loop still degrades gracefully
+   * on small machines. */
+  UINT64 heap=0; UINTN heap_pages=64*256;
   EFI_STATUS hs=EFI_LOAD_ERROR;
   for(; heap_pages>=2*256; heap_pages/=2)
     if(!(hs=BS->AllocatePages(AllocateAnyPages,EfiLoaderData,heap_pages,&heap))) break;
@@ -874,6 +877,16 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st){
   bootinfo.heap_base = heap;
   bootinfo.heap_size = (UINT64)heap_pages<<12;
   bootinfo.rsdp      = find_rsdp();
+
+  /* hand the kernel the pristine splash frame and the panel rect so its
+   * console keeps living inside the same translucent box. g_frame is
+   * EfiLoaderData, so it survives ExitBootServices. Only when the overlay
+   * actually ran: ol_panel set means the rect passed the geometry checks. */
+  if(g_frame && ol_panel){
+    bootinfo.splash_base = (UINT64)(UINTN)g_frame;
+    bootinfo.panel_x = pl_x; bootinfo.panel_y = pl_y;
+    bootinfo.panel_w = pl_w; bootinfo.panel_h = pl_h;
+  }
 
   con_attr(ATTR_WARN);
   puts16(u"\r\n  Handing over to the kernel...\r\n");

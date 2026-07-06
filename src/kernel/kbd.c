@@ -1,9 +1,16 @@
 /* kbd.c - PS/2 keyboard, scancode set 1, US layout.
  *
- * IRQ1 pushes scancodes into a ring buffer; kbd_getc() drains it and does
- * the scancode -> ASCII translation (shift, caps lock, arrows). USB
- * keyboards reach this through the firmware's PS/2 legacy emulation; a
- * native USB HID stack is a later stage.
+ * Scancodes land in a ring buffer two ways: IRQ1 when the board delivers
+ * it, and a status-register poll from kbd_getc()'s wait loop. The poll is
+ * not an optimization - on some boards IRQ1 simply never arrives (IOAPIC-
+ * only routing with the legacy PIC line unwired, or USB legacy emulation
+ * where SMM traps port 0x60/0x64 but raises no interrupt), and an
+ * IRQ-only driver reads as "keyboard dead" there. The PIT ticks at 100 Hz,
+ * so the hlt in kbd_getc() wakes and re-polls at least every 10 ms even
+ * with IRQ1 completely dead. kbd_getc() drains the buffer and does the
+ * scancode -> ASCII translation (shift, caps lock, arrows). USB keyboards
+ * reach this through the firmware's PS/2 legacy emulation; a native USB
+ * HID stack is a later stage.
  *
  * Hardware diversity handled here:
  *  - No 8042 at all (Intel Macs, some modern boards): the status port
@@ -87,11 +94,26 @@ int kbd_init(void){
   return 1;
 }
 
-void kbd_irq(void){
-  u8 sc = inb(KBC_DATA);
-  u32 n = (wr + 1) % BUFSZ;
-  if(n != rd){ buf[wr] = sc; wr = n; }
+/* Move any pending scancodes from the controller into the ring buffer.
+ * Callers hold interrupts off (IRQ1 handler, or kbd_getc under cli), so
+ * poll and IRQ never race each other. Checking OBF before every read also
+ * keeps the two entry paths honest: once one of them takes the byte, the
+ * other sees OBF clear and reads nothing (port 0x60 with OBF clear just
+ * returns the last byte again - reading it would duplicate keystrokes).
+ * Bounded: a controller streaming garbage can't trap us here. */
+static void kbd_poll(void){
+  for(int i=0; i<16; i++){
+    u8 st = inb(KBC_STAT);
+    if(st == 0xFF || !(st & 1)) return;   /* absent, or nothing pending */
+    u8 sc = inb(KBC_DATA);
+    if(st & 0x20) continue;               /* aux (mouse) byte: not ours */
+    u32 n = (wr + 1) % BUFSZ;
+    if(n != rd){ buf[wr] = sc; wr = n; }
+    io_wait();
+  }
 }
+
+void kbd_irq(void){ kbd_poll(); }
 
 static int pop(void){
   if(rd == wr) return -1;
@@ -105,6 +127,7 @@ static int pop(void){
 int kbd_getc(void){
   for(;;){
     cli();
+    kbd_poll();                 /* boards where IRQ1 never fires */
     int sc = pop();
     if(sc < 0){ __asm__ __volatile__("sti; hlt"); continue; }
     sti();

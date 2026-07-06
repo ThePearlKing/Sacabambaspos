@@ -5,7 +5,7 @@
 #ifndef SBOS_BOOTINFO_H
 #define SBOS_BOOTINFO_H
 
-#define SBOS_BOOTINFO_MAGIC 0x53414341424F4F54ULL   /* "SACABOOT" */
+#define SBOS_BOOTINFO_MAGIC 0x53414341424F4F32ULL   /* "SACABOO2" */
 
 /* framebuffer pixel layout, 32bpp only (loader refuses anything else) */
 #define SBOS_PIXFMT_BGRX 0   /* byte order B,G,R,X - most UEFI GOPs */
@@ -29,6 +29,13 @@ typedef struct {
 
   /* INIT.RC boot script, loaded from the ESP (0/0 if absent) */
   unsigned long long initrc_base, initrc_size;
+
+  /* pristine splash frame (BGRA, fb_width x fb_height rows, no pitch) and
+   * the translucent panel rect the boot log lived in. The kernel console
+   * keeps living inside that panel, re-blending the tint from this frame.
+   * splash_base == 0: no splash survived, console takes the whole screen. */
+  unsigned long long splash_base;
+  unsigned int       panel_x, panel_y, panel_w, panel_h;
 } SbosBootInfo;
 
 #endif
