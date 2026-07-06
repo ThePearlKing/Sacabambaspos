@@ -2,19 +2,30 @@
 
 The most epic operating system in all of eternal existence.
 
-Stage 0 is a **from-scratch bootloader** that boots on modern hardware (UEFI:
-Mac, PC, laptop, virtual machine), detects the display, and paints the
-**Sacabambaspis** full-screen. It runs entirely **live / in memory** — it reads
-only the USB, writes to **no disk**, and installs nothing. Pull the stick and
-your machine is untouched.
+Boots from a USB stick on modern hardware (UEFI: Mac, PC, laptop, virtual
+machine) all the way into its **own kernel and interactive shell**. Runs
+entirely **live / in memory** — it reads only the USB, writes to **no disk**,
+and installs nothing. Pull the stick and your machine is untouched.
 
 ```
-  USB power-on -> firmware runs \EFI\BOOT\BOOTX64.EFI
-               -> boot log ([ OK ] watchdog, firmware, display, asset, live mode)
+  USB power-on -> firmware runs \EFI\BOOT\BOOTX64.EFI          (stage 0, loader)
                -> splash: Sacabambaspis scaled-to-fit + centred,
-                  "SacabambaspOS" title (cyan OS), version badge bottom-right
-               -> idle
+                  "SacabambaspOS" title, version badge
+               -> translucent boot console (bottom-left) replays the boot log
+                  and follows the kernel handoff live
+               -> loader places KERNEL.ELF, exits boot services, jumps
+               -> kernel (stage 1): GDT/IDT, PIC+PIT, PS/2 keyboard,
+                  framebuffer console with color                (own code, no UEFI)
+               -> /SBOS/INIT.RC runs, then an interactive shell with live
+                  syntax coloring - type help
 ```
+
+## Keyboard on real hardware
+
+The kernel speaks PS/2. Laptop internal keyboards are PS/2 and work; USB
+keyboards work only if the firmware offers PS/2 legacy emulation (many boards
+call it "USB Legacy Support" — usually on by default). A native USB HID stack
+is on the roadmap.
 
 ## Secure Boot
 
@@ -29,10 +40,15 @@ afterwards and the machine is exactly as before.
 
 | Piece | File | Notes |
 |-------|------|-------|
-| UEFI boot app | `src/efi/boot.c` | own minimal EFI headers (`efi.h`), no gnu-efi |
+| UEFI loader | `src/efi/boot.c` | own minimal EFI headers (`efi.h`), no gnu-efi; splash, boot console overlay, ELF kernel loader, ExitBootServices handoff |
 | PE reloc stub | `src/efi/reloc.S` | makes the hand-built `.EFI` loadable by real firmware |
 | Linker scripts | `src/efi/elf_*_efi.lds` | ELF→PE layout for x86-64 and ia32 |
+| Kernel | `src/kernel/` | x86-64, static PIE: GDT/IDT/exceptions, PIC+PIT, PS/2 keyboard, framebuffer console (also mirrored to COM1) |
+| Shell | `src/kernel/shell.c` | live syntax coloring, history, builtins (`help`, `mem`, `uptime`, `fish`, ...) |
+| Init script | `src/init/INIT.RC` | run by the kernel at boot, before the prompt |
+| Handoff contract | `src/shared/bootinfo.h` | loader → kernel: framebuffer, heap, RAM, ACPI RSDP, INIT.RC |
 | Image → framebuffer | `tools/mkasset.py` | JPG → raw BGRA blob (`SBMP` format); no in-OS JPEG decoder |
+| Console font | `tools/mkfont.py` | converts the host's PSF console font to an 8x16 C header at build time |
 | GPT disk builder | `tools/mkimage.py` | protective MBR + GPT + EFI System Partition, authored by hand |
 | Build | `scripts/build.sh` | produces `build/sacabambaspos.img` |
 | Emulator test | `scripts/run-qemu.sh` | boots the image in QEMU + OVMF, screenshots it |
@@ -93,11 +109,16 @@ firmware boots it too:
 
 Early days — under active development.
 
-- [x] UEFI x86-64 boot + image display (Mac, PC, laptop, modern VM) — **verified in QEMU/OVMF**
-- [x] Best-effort UEFI ia32 (`BOOTIA32.EFI`) for 32-bit EFI Macs
+- [x] Stage 0: UEFI x86-64 boot + splash (Mac, PC, laptop, modern VM) — **verified in QEMU/OVMF**
+- [x] Best-effort UEFI ia32 (`BOOTIA32.EFI`) for 32-bit EFI Macs (splash only)
+- [x] Stage 1: kernel + interactive shell — boot console overlay, ELF loader,
+      ExitBootServices, GDT/IDT, PIC/PIT, PS/2 keyboard, framebuffer console,
+      INIT.RC, syntax-colored shell — **verified in QEMU/OVMF incl. keyboard input**
+- [ ] Stage 2: ring 3 userland — ELF loading, syscalls, real `/bin` utilities
+- [ ] Own page tables + memory protection (W^X, guard pages); the modern-kernel
+      research list (capabilities, per-CPU, CoW storage) feeds this design
 - [ ] Legacy BIOS path (16-bit MBR + VBE) for pre-UEFI PCs
 - [ ] Configurable/customisable boot (background, image, options via a config file)
-- [ ] A kernel. An actual operating system. Eternal glory.
 
 **Live-only for now — nothing is ever installed.** The installer comes later,
 when the OS is complete and can be tried in-memory first.

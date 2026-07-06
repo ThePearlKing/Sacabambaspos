@@ -1,0 +1,5 @@
+# SacabambaspOS init script. The kernel runs each line through the shell
+# at boot, before handing you the prompt. '#' lines are comments.
+ver
+fish
+echo type help to see what works

@@ -148,8 +148,16 @@ typedef struct _EFI_SIMPLE_FILE_SYSTEM_PROTOCOL {
 
 /* ---- Boot Services (subset; padded to keep offsets correct) ---- */
 typedef enum { AllocateAnyPages, AllocateMaxAddress, AllocateAddress } EFI_ALLOCATE_TYPE;
-typedef enum { EfiReservedMemoryType, EfiLoaderData_ = 2 } EFI_MEMORY_TYPE_STUB;
-#define EfiLoaderData 2
+#define EfiLoaderCode         1
+#define EfiLoaderData         2
+#define EfiBootServicesCode   3
+#define EfiBootServicesData   4
+#define EfiConventionalMemory 7
+
+typedef struct {
+  UINT32 Type; UINT32 Pad;
+  UINT64 PhysicalStart, VirtualStart, NumberOfPages, Attribute;
+} EFI_MEMORY_DESCRIPTOR;
 
 typedef struct {
   EFI_TABLE_HEADER Hdr;
@@ -158,7 +166,8 @@ typedef struct {
   /* Memory */
   EFI_STATUS (EFIAPI *AllocatePages)(EFI_ALLOCATE_TYPE, UINTN, UINTN, UINT64*);
   VOID *FreePages;
-  VOID *GetMemoryMap;
+  EFI_STATUS (EFIAPI *GetMemoryMap)(UINTN *MapSize, EFI_MEMORY_DESCRIPTOR *Map,
+                                    UINTN *MapKey, UINTN *DescSize, UINT32 *DescVer);
   EFI_STATUS (EFIAPI *AllocatePool)(UINTN, UINTN, VOID**);
   EFI_STATUS (EFIAPI *FreePool)(VOID*);
   /* Event & Timer */
@@ -171,7 +180,8 @@ typedef struct {
   EFI_STATUS (EFIAPI *LocateHandle)(UINTN, EFI_GUID*, VOID*, UINTN*, EFI_HANDLE*);
   VOID *LocateDevicePath, *InstallConfigurationTable;
   /* Image */
-  VOID *LoadImage, *StartImage, *Exit, *UnloadImage, *ExitBootServices;
+  VOID *LoadImage, *StartImage, *Exit, *UnloadImage;
+  EFI_STATUS (EFIAPI *ExitBootServices)(EFI_HANDLE, UINTN MapKey);
   /* Misc */
   VOID *GetNextMonotonicCount;
   EFI_STATUS (EFIAPI *Stall)(UINTN);
@@ -188,6 +198,8 @@ typedef struct {
   VOID *CalculateCrc32, *CopyMem, *SetMem, *CreateEventEx;
 } EFI_BOOT_SERVICES;
 
+typedef struct { EFI_GUID VendorGuid; VOID *VendorTable; } EFI_CONFIGURATION_TABLE;
+
 typedef struct {
   EFI_TABLE_HEADER Hdr;
   CHAR16 *FirmwareVendor; UINT32 FirmwareRevision;
@@ -196,7 +208,7 @@ typedef struct {
   EFI_HANDLE StandardErrorHandle; EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *StdErr;
   VOID *RuntimeServices;
   EFI_BOOT_SERVICES *BootServices;
-  UINTN NumberOfTableEntries; VOID *ConfigurationTable;
+  UINTN NumberOfTableEntries; EFI_CONFIGURATION_TABLE *ConfigurationTable;
 } EFI_SYSTEM_TABLE;
 
 #define EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID \
@@ -205,5 +217,9 @@ typedef struct {
  {0x5b1b31a1,0x9562,0x11d2,{0x8e,0x3f,0x00,0xa0,0xc9,0x69,0x72,0x3b}}
 #define EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID \
  {0x964e5b22,0x6459,0x11d2,{0x8e,0x39,0x00,0xa0,0xc9,0x69,0x72,0x3b}}
+#define EFI_ACPI_20_TABLE_GUID \
+ {0x8868e871,0xe4f1,0x11d3,{0xbc,0x22,0x00,0x80,0xc7,0x3c,0x88,0x81}}
+#define EFI_ACPI_10_TABLE_GUID \
+ {0xeb9d2d30,0x2d88,0x11d3,{0x9a,0x16,0x00,0x90,0x27,0x3f,0xc1,0x4d}}
 
 #endif
