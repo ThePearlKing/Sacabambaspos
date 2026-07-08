@@ -43,8 +43,10 @@ int main(void){
   for(int x = 0; x < W; x++){ cell(x, 1, '-', SBOS_C_DGREY); cell(x, H-1, '-', SBOS_C_DGREY); }
   for(int y = 1; y < H; y++){ cell(0, y, '|', SBOS_C_DGREY); cell(W-1, y, '|', SBOS_C_DGREY); }
 
+  /* constant speed: the danger comes from your own growing tail */
   int hx = W/2, hy = H/2, dx = 1, dy = 0;
-  int tail = 0, head = 0, score = 0, delay = 120, grow = 2;
+  int tail = 0, head = 0, score = 0, grow = 2;
+  const int delay = 120;
   body[0] = (u16)(hx << 8 | hy);
   occ[hx][hy] = 1;
   cell(hx, hy, 'O', SBOS_C_LGREEN);
@@ -80,7 +82,6 @@ int main(void){
 
     if(hx == fx && hy == fy){
       score++; grow += 2;
-      if(delay > 50) delay -= 3;
       status(score);
       do {
         fx = 1 + (int)(rnd_next(&seed) % (W - 2));
