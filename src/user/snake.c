@@ -81,7 +81,7 @@ int main(void){
     cell(hx, hy, 'O', SBOS_C_LGREEN);
 
     if(hx == fx && hy == fy){
-      score++; grow += 2;
+      score++; grow += 1;      /* og rules: one segment per food */
       status(score);
       do {
         fx = 1 + (int)(rnd_next(&seed) % (W - 2));
